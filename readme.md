@@ -1,6 +1,6 @@
 # CANDY Diffusion Model
 
-This repository contains the implementation of the CANDY Diffusion Model, a novel diffusion-based framework for image segmentation and time-series prediction tasks.
+This repository contains the implementation of the CANDY Diffusion Model, a novel diffusion-based framework. This project is for image segmentation task. ![Alt text](img.png)
 
 ## Ablation Study Design
 
