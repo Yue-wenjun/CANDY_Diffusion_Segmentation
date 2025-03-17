@@ -156,5 +156,16 @@ We designed six ablation groups to analyze the contribution of each component in
 
 ## Running the Code
 
-```bash
-python mian.py 
+### Step1:
+Download raw data and run
+  ```bash
+  python data_processing.py 
+  ```
+
+### Step2:
+
+Create a foleder to store test output and change your path, then
+
+  ```bash
+  python mian.py 
+  ```
