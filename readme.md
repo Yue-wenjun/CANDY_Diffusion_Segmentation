@@ -4,7 +4,7 @@ This repository contains the implementation of the CANDY Diffusion Model, a nove
 
 ## Ablation Study Design
 
-We designed six ablation groups to analyze the contribution of each component in the model. Below are the details of each group and the corresponding code changes:
+We designed six ablation groups to analyze the contribution of each component in the model. All changes are made in models/diffusion.py. Below are the details of each group and the corresponding code changes:
 
 ---
 
