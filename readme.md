@@ -75,23 +75,7 @@ We designed six ablation groups to analyze the contribution of each component in
 
 ---
 
-### 5. **Ablation Group 4: Remove Segmentation Head**
-- **Description**: Remove the Segmentation Head to observe the model's performance in unsupervised tasks.
-- **Code Changes**:
-  - Remove the `self.seg_head` and related code in the `forward` method:
-    ```python
-    # Original code with Segmentation Head
-    output_seg = self.seg_head(output)
-    output_seg = torch.sum(output_seg, dim=1, keepdim=True)
-    return output_seg
-
-    # Modified code without Segmentation Head
-    return output  # Directly return the output of the reverse diffusion process
-    ```
-
----
-
-### 6. **Ablation Group 5: Replace ODE with SDE**
+### 5. **Ablation Group 4: Replace ODE with SDE**
 - **Description**: Replace the ODE structure with SDE (Stochastic Differential Equation) to analyze the impact of stochasticity on model performance.
 - **Code Changes**:
   - Add random noise to the output of the CANDY modules in the forward diffusion process:
@@ -111,7 +95,7 @@ We designed six ablation groups to analyze the contribution of each component in
 
 ---
 
-### 7. **Ablation Group 6: Increase Diffusion Steps (T)**
+### 6. **Ablation Group 5: Increase Diffusion Steps (T)**
 - **Description**: Increase the number of diffusion steps (`T`) to evaluate the model's performance with more steps.
 - **Code Changes**:
   - Modify the `T` value in the `__init__` method:
