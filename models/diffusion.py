@@ -1,4 +1,3 @@
-# models.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,16 +24,30 @@ class DiffusionModel(nn.Module):
         self.batch_size = batch_size
         self.T = T  # Number of diffusion steps
 
-        # Create a list of CANDY modules, one for each time step
+        # ====== Forward modules ======
         self.candies = nn.ModuleList(
             [
-                CANDY(batch_size, in_channel, hidden_channel, out_channel, input_size, hidden_size,)
+                CANDY(
+                    batch_size,
+                    in_channel,
+                    hidden_channel,
+                    out_channel,
+                    input_size,
+                    hidden_size,
+                )
                 for _ in range(T)
             ]
         )
 
-        # Create a list of UNet modules, one for each time step
         self.unets = nn.ModuleList([UNet(in_channel, out_channel) for _ in range(T)])
+
+        # ====== New: Fusion convs for reverse diffusion ======
+        self.fusion_convs = nn.ModuleList(
+            [
+                nn.Conv2d(in_channel * 2, in_channel, kernel_size=3, padding=1)
+                for _ in range(T)
+            ]
+        )
 
         self.seg_head = nn.Conv2d(out_channel, num_classes, kernel_size=1)
 
@@ -45,25 +58,35 @@ class DiffusionModel(nn.Module):
         ).to(device)
         input = x
 
-        # Forward diffusion process (adding noise in each step)
+        # ====== Forward diffusion process ======
         for t in range(self.T):
-            # Pass through the t-th CANDY module (feature processing)
             output = self.candies[t](input)
             origin[t] = input
             input = output
+            output = self.candies[t](input)
 
+        # ====== Graph schedule ======
         if graph_schedule is None:
             graph_schedule = torch.linspace(0.7, 0.2, self.T).to(device)
 
-        # Reverse diffusion process (denoising)
+        # ====== Reverse diffusion process ======
         for t in reversed(range(self.T)):
             graph_factor = graph_schedule[t]
-            reverse_input = (1 - graph_factor) * input + graph_factor * origin[t]
 
-            # Pass through the t-th UNet module for reconstruction
+            # Step 1: concatenate noisy and original feature maps
+            fusion_input = torch.cat([input, origin[t]], dim=1)
+
+            # Step 2: fuse via learnable conv
+            fused_feature = self.fusion_convs[t](fusion_input)
+
+            # Step 3: apply graph_factor modulation
+            reverse_input = (1 - graph_factor) * fused_feature + graph_factor * origin[t]
+
+            # Step 4: U-Net reconstruction
             output = self.unets[t](reverse_input)
-            input = output  # Update input for the next step
+            input = output  # feedback for next step
 
+        # ====== Segmentation head ======
         output_seg = self.seg_head(output)
         output_seg = torch.sum(output_seg, dim=1, keepdim=True)
 
