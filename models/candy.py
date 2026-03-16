@@ -44,7 +44,6 @@ class CANDY(nn.Module):
         return p_set
 
     def forward(self, x):
-        # x = x.view(self.batch_size * self.in_channel, self.hidden_size, self.input_size)
         x = x.view(self.batch_size * self.hidden_channel, self.hidden_size, self.input_size)
         p_set = self.split_input(x)
 
