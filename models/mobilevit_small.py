@@ -29,18 +29,7 @@ class MobileViTSmall(nn.Module):
             nn.Conv2d(256, out_channel, kernel_size=1)
         )
 
-    def forward(self, x):
-        # 提取空间收缩后的全局特征
-        features = self.backbone(x) 
-        
-        # 映射通道数到目标输出通道
+    def forward(self, x, t=None):   # t ignored; present for uniform DiffusionModel API
+        features = self.backbone(x)
         out = self.decoder(features)
-        
-        # 双线性上采样恢复到输入特征的尺寸 (H, W)
-        out = F.interpolate(
-            out, 
-            size=x.shape[-2:], 
-            mode="bilinear", 
-            align_corners=False
-        )
-        return out
+        return F.interpolate(out, size=x.shape[-2:], mode="bilinear", align_corners=False)

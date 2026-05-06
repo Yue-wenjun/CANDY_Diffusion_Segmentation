@@ -15,7 +15,7 @@ from config import BASE_CONFIG, get_config, ABLATION_REGISTRY
 
 class DiffusionCLI:
     def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda")
 
     def run_pipeline(
         self, model_type, num_epochs=1, custom_steps=None, k_folds=1, current_fold=0

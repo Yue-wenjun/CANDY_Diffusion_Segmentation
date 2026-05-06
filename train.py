@@ -1,95 +1,205 @@
-# training.py
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import time
 import os
-import torch.nn.functional as F
+from utils import calculate_proportion, calculate_iou, calculate_dice
 
 
-def train(model, dataloader, optimizer, device, epoch, batch_size, checkpoint_path, criterion):
+def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, checkpoint_path, criterion, save_interval=10):
     model.train()
     running_loss = 0.0
     batch_loss = 0.0
     early_stop_counter = 0
-    early_stop_threshold = 0.002
+    early_stop_threshold = 0.0002
     patience = 5
 
     for batch_idx, (images, masks) in enumerate(dataloader):
         images, masks = images.to(device), masks.to(device)
+
+        # 检查输入数据
+        if torch.isnan(images).any() or torch.isnan(masks).any():
+            print(f"NaN detected in input data at batch {batch_idx}")
+            continue
+
         if images.size(0) < batch_size:
             continue
-        if torch.isnan(images).any():
-            print(f"NaN detected in images at batch {batch_idx}")
-        if torch.isnan(masks).any():
-            print(f"NaN detected in masks at batch {batch_idx}")
+
         optimizer.zero_grad()
         output_seg = model(images)
+
+        # 检查模型输出
+        if torch.isnan(output_seg).any():
+            print(f"NaN detected in model output at batch {batch_idx}")
+            continue
+
         loss = criterion(output_seg, masks)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"NaN/Inf loss at batch {batch_idx}, skipping...")
+            continue
+
         loss.backward()
+
+        # 梯度裁剪防止梯度爆炸
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # 检查梯度
+        nan_grads = False
+        for param in model.parameters():
+            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                nan_grads = True
+                break
+
+        if nan_grads:
+            print(f"NaN/Inf gradients at batch {batch_idx}, skipping update...")
+            optimizer.zero_grad()  # 清除有问题的梯度
+            continue
+
         optimizer.step()
+        scheduler.step()
+
         running_loss += loss.item()
         batch_loss += loss.item()
 
+        # 定期保存检查点
+        if batch_idx % save_interval == 0:
+            save_checkpoint(model, optimizer, scheduler, epoch, checkpoint_path)
+            print(f"Checkpoint saved at epoch {epoch}, batch {batch_idx}")
+
         if batch_idx % 10 == 9:
             print(
-                f"Epoch [{epoch + 1}], Batch [{batch_idx + 1}/{len(dataloader)}], 10 batch avg Loss: {batch_loss/10}, Loss: {loss.item()}"
-            )
-            batch_loss = 0
-        if loss.item() < early_stop_threshold:
-            early_stop_counter += 1
-        else:
-            early_stop_counter = 0
-        if early_stop_counter >= patience:
-            print(f"Early stopping triggered at epoch {epoch}, batch {batch_idx}")
-            break
+                f"Epoch [{epoch + 1}], Batch [{batch_idx + 1}/{len(dataloader)}], 10 batch avg Loss: {batch_loss / 10}, Loss: {loss.item()}")
+            batch_loss = 0.0
 
-        save_checkpoint(model, optimizer, epoch, checkpoint_path)
+        # if loss.item() < early_stop_threshold:
+        #     early_stop_counter += 1
+        # else:
+        #     early_stop_counter = 0
+        #
+        # if early_stop_counter >= patience:
+        #     print(f"Early stopping triggered at epoch {epoch}, batch {batch_idx}")
+        #     # 保存最终检查点
+        #     save_checkpoint(model, optimizer, scheduler, epoch, checkpoint_path, batch_idx)
+        #     break
 
     avg_loss = running_loss / len(dataloader)
     print(f"Epoch [{epoch}] Average Loss: {avg_loss}")
+
+    # 保存每个epoch结束时的检查点
+    save_checkpoint(model, optimizer, scheduler, epoch, checkpoint_path, "final")
+
     return avg_loss
 
 
-def val(model, dataloader, device, batch_size, criterion):
+def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
     model.eval()
-    running_loss = 0.0
+    total_loss = 0.0
+    total_iou = 0.0
+    total_dice = 0.0
+    total_proportion = 0.0
+    num_samples = 0
+
+    # 如果有检查点路径，则加载最佳模型
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        load_checkpoint(model, None, None, checkpoint_path)  # 验证时不需要加载优化器状态
+        print(f"Loaded best model from {checkpoint_path} for validation")
 
     with torch.no_grad():
         for batch_idx, (images, masks) in enumerate(dataloader):
             images, masks = images.to(device), masks.to(device)
+
+            # 跳过不完整的批次
             if images.size(0) < batch_size:
                 continue
+
             output_seg = model(images)
-            criterion = nn.BCEWithLogitsLoss()
+
+            # 计算损失
             seg_loss = criterion(output_seg.squeeze(1), masks.squeeze(1))
-            total_loss = seg_loss
-            running_loss += total_loss.item()
+            total_loss += seg_loss.item()
 
-    avg_loss = running_loss / len(dataloader)
-    print(f"Val Average Loss: {avg_loss}")
-    return avg_loss
+            # 计算指标
+            batch_size_current = images.size(0)
+            num_samples += batch_size_current
+
+            # 对每个样本单独计算指标
+            for i in range(batch_size_current):
+                y_true = masks[i].unsqueeze(0)  # 保持批次维度
+                y_pred = output_seg[i].unsqueeze(0)
+
+                # 计算IoU
+                iou = calculate_iou(y_true, y_pred)
+                total_iou += iou
+
+                # 计算Dice
+                dice = calculate_dice(y_true, y_pred)
+                total_dice += dice
+
+                # 计算proportion
+                proportion = calculate_proportion(y_pred)
+                total_proportion += proportion
+
+    # 计算平均指标
+    avg_iou = total_iou / num_samples if num_samples > 0 else 0
+    avg_dice = total_dice / num_samples if num_samples > 0 else 0
+    avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
+    avg_proportion = total_proportion / num_samples if num_samples > 0 else 0
+
+    print(f"Validation Results:")
+    print(f"Average IoU: {avg_iou:.4f}")
+    print(f"Average Dice: {avg_dice:.4f}")
+    print(f"Average Loss: {avg_loss:.4f}")
+    print(f"Average proportion of pixels between -1 and 1: {avg_proportion:.4f}")
+
+    return {
+        'loss': avg_loss,
+        'iou': avg_iou,
+        'dice': avg_dice,
+        'proportion': avg_proportion
+    }
 
 
-def save_checkpoint(model, optimizer, epoch, checkpoint_path):
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        },
-        checkpoint_path,
-    )
+def save_checkpoint(model, optimizer, scheduler, epoch, checkpoint_path, batch_idx=None):
+    # 确保目录存在
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "batch_idx": batch_idx
+    }
+
+    if optimizer is not None:
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+
+    # 【新增】保存 scheduler 状态
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
 
 
-def load_checkpoint(model, optimizer, checkpoint_path):
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path):
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, map_location="cuda")
         model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        print(f"Resuming training from epoch {start_epoch}")
-        return start_epoch
+
+        if optimizer is not None and "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # 【新增】加载 scheduler 状态
+        if scheduler is not None and "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        elif scheduler is not None:
+            print("警告: 之前的 Checkpoint 中没有 Scheduler 状态，学习率将重新开始调度。")
+
+        start_epoch = checkpoint['epoch']
+        # start_epoch = 1  <--- 【已修复】这行强制把读取的 epoch 变成了 1，会导致逻辑错误，已注释
+        batch_idx = checkpoint.get("batch_idx", 0)
+
+        print(f"Resuming training from epoch {start_epoch}, batch {batch_idx}")
+        # 【已修复】统一返回两个值，避免外层调用时解包报错
+        return start_epoch, batch_idx
     else:
         print("No checkpoint found. Starting from epoch 0.")
-        return 0
+        return 0, 0

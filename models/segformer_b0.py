@@ -22,16 +22,7 @@ class SegFormerB0(nn.Module):
         )
         self.model = SegformerForSemanticSegmentation(config)
 
-    def forward(self, x):
-        # 1. 前向传播提取特征并过 All-MLP 解码器
+    def forward(self, x, t=None):   # t ignored; present for uniform DiffusionModel API
         outputs = self.model(pixel_values=x)
-        logits = outputs.logits  # 输出形状: (B, out_channel, H/4, W/4)
-        
-        # 2. 双线性上采样恢复到输入特征的尺寸 (H, W)
-        logits = F.interpolate(
-            logits, 
-            size=x.shape[-2:], 
-            mode="bilinear", 
-            align_corners=False
-        )
-        return logits
+        logits = outputs.logits     # (B, out_channel, H/4, W/4)
+        return F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)

@@ -49,7 +49,8 @@ def run_model(model_name, epochs=10, k_folds=4, steps=None):
 def main():
     # 定义要运行的模型列表
     models_to_run = [
-        "baseline",  # 基础模型
+        # "mobilevit",  # 基础模型
+        "baseline"
         # "adjust_steps",  # 调整步数的模型（需要steps参数）
         # "simple_decoder",  # 其他模型
         # "simple_cnn",

@@ -1,155 +1,183 @@
-# CANDY Diffusion Model
+# CANDY Diffusion Segmentation
 
-This repository contains the implementation of the CANDY Diffusion Model, a novel diffusion-based framework. This project is for image segmentation task. ![Alt text](img.png)
+Diffusion-based segmentation model combining a **CANDY** (Causal Attractor Network with Dynamic Yield) forward encoder chain with a shared timestep-conditioned U-Net decoder.
 
-## Ablation Study Design
-
-We designed six ablation groups to analyze the contribution of each component in the model. All changes are made in models/diffusion.py. Below are the details of each group and the corresponding code changes:
+![Architecture overview](img.png)
 
 ---
 
-### 1. **Baseline**
-- **Description**: The full CANDY Diffusion model with all components (CANDY modules, UNet decoder, Skip Connection, and Segmentation Head).
-- **Code**: No changes are made to the original implementation.
+## Architecture
+
+```
+Input x
+  │
+  ├─ CANDY_0 ──► origin[0]
+  ├─ CANDY_1 ──► origin[1]      ← T independent CANDY encoders (~315K each)
+  ·
+  └─ CANDY_{T-1} ──► origin[T-1]
+        │ feat
+        ▼
+  ◄── reverse t = T-1 .. 0 ──────────────────────────────────────────────
+  │   fusion_conv_t( cat[feat, origin[t]] )
+  │   + graph_schedule weighted skip
+  │   → shared UNet( reverse_input, timestep_emb(t) )
+  │     └─ multi-scale t-conditioning: bottleneck + up1 ~ up4
+  ▼
+seg_head  →  [B, num_classes, H, W]  logits
+```
+
+**Parameter budget (T=2, default):**
+
+| Module          | Count | Params  |
+|-----------------|-------|---------|
+| CANDY encoders  | T=2   | ~0.6 M  |
+| Shared UNet     | 1     | ~31.1 M |
+| fusion\_convs   | T=2   | < 1 K   |
+| seg\_head       | 1     | < 1 K   |
+| **Total**       |       | **~31.7 M** |
+
+Naïve T independent UNets: T × 31 M = **62 M** (T=2) / **155 M** (T=5).
 
 ---
 
-### 2. **Ablation Group 1: Remove Skip Connection**
-- **Description**: Remove Skip Connection to observe its impact on information propagation during the reverse diffusion process.
-- **Code Changes**:
-  - Modify the reverse diffusion process in the `forward` method:
-    ```python
-    # Original code with Skip Connection
-    reverse_input = (1 - graph_factor) * input + graph_factor * origin[t]
+## Environment
 
-    # Modified code without Skip Connection
-    reverse_input = input  # Skip Connection removed
-    ```
+```bash
+pip install torch torchvision monai transformers timm rasterio scikit-learn tqdm
+```
 
 ---
 
-### 3. **Ablation Group 2: Replace CANDY Modules with Simple CNN Modules**
-- **Description**: Replace the CANDY modules with simple CNN modules to analyze the effectiveness of the CANDY architecture.
-- **Code Changes**:
-  - Replace the `self.candies` initialization in the `__init__` method:
-    ```python
-    # Original CANDY modules
-    self.candies = nn.ModuleList([
-        CANDY(batch_size, in_channel, hidden_channel, out_channel, input_size, hidden_size)
-        for _ in range(T)
-    ])
+## Dataset
 
-    # Modified simple CNN modules
-    self.candies = nn.ModuleList([
-        nn.Sequential(
-            nn.Conv2d(in_channel, hidden_channel, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_channel, out_channel, kernel_size=3, stride=1, padding=1)
-        )
-        for _ in range(T)
-    ])
-    ```
+Single-channel SAR images (`.tif`, 252 × 252, binary segmentation).
 
----
+```
+project/
+├── cropped_images/              # clean images
+├── cropped_masks/               # binary masks (0 / 1)
+└── cropped_noised_data/
+    ├── cropped_noised_0dB/
+    ├── cropped_noised_10dB/
+    └── cropped_noised_20dB/
+```
 
-### 4. **Ablation Group 3: Remove UNet Decoder**
-- **Description**: Remove the UNet decoder and replace it with a simple linear decoder to evaluate its importance in the reverse diffusion process.
-- **Code Changes**:
-  - Replace the `self.unets` initialization in the `__init__` method:
-    ```python
-    # Original UNet decoder
-    self.unets = nn.ModuleList([
-        UNet(in_channel, out_channel)
-        for _ in range(T)
-    ])
+**Split strategy (no data leakage):**
 
-    # Modified simple linear decoder
-    self.unets = nn.ModuleList([
-        nn.Sequential(
-            nn.Conv2d(in_channel, out_channel, kernel_size=1),
-            nn.ReLU()
-        )
-        for _ in range(T)
-    ])
-    ```
+```
+All N samples
+├── Held-out test set : last 15%   (fixed across ALL models and folds)
+└── Train + Val       : first 85%
+    ├── Fold 0 : ~63.75% train  /  ~21.25% val
+    ├── Fold 1 : ~63.75% train  /  ~21.25% val
+    ├── Fold 2 : ~63.75% train  /  ~21.25% val
+    └── Fold 3 : ~63.75% train  /  ~21.25% val
+```
 
 ---
 
-### 5. **Ablation Group 4: Replace ODE with SDE**
-- **Description**: Replace the ODE structure with SDE (Stochastic Differential Equation) to analyze the impact of stochasticity on model performance.
-- **Code Changes**:
-  - Add random noise to the output of the CANDY modules in the forward diffusion process:
-    ```python
-    # Original ODE-based forward diffusion
-    output = self.candies[t](input)
-    origin[t] = input
-    input = output
+## Experimental Configuration
 
-    # Modified SDE-based forward diffusion
-    output = self.candies[t](input)
-    noise = torch.randn_like(output) * 0.1  # Add random noise
-    output = output + noise
-    origin[t] = input
-    input = output
-    ```
+| Hyperparameter   | Value                        |
+|------------------|------------------------------|
+| Batch size       | 64                           |
+| Epochs           | 11                           |
+| Optimizer        | Adam                         |
+| Learning rate    | 5 × 10⁻⁴                    |
+| LR schedule      | OneCycleLR (10% warmup)      |
+| Loss             | DiceLoss (sigmoid)           |
+| Cross-validation | 4-fold                       |
+| Input size       | 252 × 252                    |
+| Diffusion steps  | T = 2 (default)              |
+| Graph schedule   | linspace(0.7 → 0.2)         |
 
 ---
 
-### 6. **Ablation Group 5: Increase Diffusion Steps (T)**
-- **Description**: Increase the number of diffusion steps (`T`) to evaluate the model's performance with more steps.
-- **Code Changes**:
-  - Modify the `T` value in the `__init__` method:
-    ```python
-    # Original T value
-    self.T = 2  # Baseline
+## Quick Start
 
-    # Modified T value
-    self.T = 5  # Increased diffusion steps
-    ```
+**Train one model (4-fold CV):**
+```bash
+python main.py baseline -e 11 -k 4
+```
 
----
+**Test on clean held-out set:**
+```bash
+python test.py baseline -k 4 -f <best_fold>
+```
 
-## Code Structure
+**Test on noisy data (config-driven, no code change):**
+```bash
+python test.py baseline_0dB  -k 4 -f <best_fold>
+python test.py baseline_10dB -k 4 -f <best_fold>
+python test.py baseline_20dB -k 4 -f <best_fold>
+```
 
-- `diffusionl.py`: Contains the implementation of the `DiffusionModel` class.
-- `candy.py`: Implementation of the CANDY module.
-- `unet.py`: Implementation of the UNet decoder.
-- `train.py`: Training script for the model.
-- `eval.py`: Evaluation script for the model.
+**Run full pipeline (train → clean test → noise test):**
+```bash
+python run_all.py
+```
 
----
-
-## Experiment Setup
-
-### Datasets
-- **Time-Series Prediction Task**: Sea Surface Temperature (SST) dataset.
-- **Image Segmentation Task**: Typhoon rainband remote sensing image dataset.
-
-### Hyperparameters
-- Optimizer: Adam
-- Learning Rate: 1e-3
-- Batch Size: 16
-- Number of Diffusion Steps (`T`): 2 (Baseline), 5 (Ablation Group 7)
-- Training Epochs: 100
-
-### Evaluation Metrics
-- **Time-Series Prediction Task**: MSE, RMSE
-- **Image Segmentation Task**: Dice coefficient, IoU
+Results and checkpoints are saved to `imgs/` and `checkpoint/` respectively.
+Log is written to `log.txt`.
 
 ---
 
-## Running the Code
+## Model Comparison
 
-### Step1:
-Download raw data and run
-  ```bash
-  python data_processing.py 
-  ```
+All models trained with identical hyperparameters; evaluated on the **same held-out 15% test set**.
 
-### Step2:
+| Model | Forward process | Decoder | Params | IoU ↑ | Dice ↑ |
+|-------|-----------------|---------|--------|-------|--------|
+| **CANDY Diffusion (ours)** | CANDY chain (learned) | Shared UNet + timestep emb | ~31.7 M | — | — |
+| DDPM baseline | Gaussian noise schedule | Shared UNet + timestep emb | ~31.7 M | — | — |
+| SegFormer-B0 | CANDY chain | MiT-B0 + All-MLP head | ~3.8 M | — | — |
+| MobileViT-S | CANDY chain | MobileViT backbone | ~5.6 M | — | — |
 
-Create a foleder to store test output and change your path, then
+---
 
-  ```bash
-  python mian.py 
-  ```
+## Ablation Study
+
+All ablations share the same CANDY Diffusion framework (T=2) unless noted.
+
+| Variant | Change vs. Baseline | IoU ↑ | Dice ↑ |
+|---------|---------------------|-------|--------|
+| **baseline** | Full model | — | — |
+| no\_skip | No skip connections / fusion in reverse | — | — |
+| simple\_cnn | CANDY → double-conv | — | — |
+| simple\_decoder | UNet → 1×1 conv | — | — |
+| sde | Gaussian noise (σ=0.1) in forward pass | — | — |
+| adjust\_steps (T=5) | 5 diffusion steps | — | — |
+
+---
+
+## Noise Robustness
+
+Best-fold checkpoint per model evaluated on Gamma-noise SAR data.
+
+| Model | Clean | 20 dB | 10 dB | 0 dB |
+|-------|-------|-------|-------|------|
+| CANDY Diffusion | — | — | — | — |
+| SegFormer-B0 | — | — | — | — |
+| MobileViT-S | — | — | — | — |
+
+---
+
+## Repository Structure
+
+```
+├── config.py            # all hyperparams & ablation registry
+├── main.py              # training entry point
+├── test.py              # independent test script
+├── run_all.py           # full pipeline runner
+├── data_loading.py      # dataset & k-fold split logic
+├── train.py             # train / val loops
+├── utils.py             # visualisation & metrics
+├── noise.py             # noisy dataset generation
+└── models/
+    ├── diffusion.py     # DiffusionModel (main)
+    ├── candy.py         # CANDY encoder
+    ├── unet.py          # UNet with timestep embedding
+    ├── segformer_b0.py  # SegFormer-B0 decoder
+    ├── mobilevit_small.py
+    └── models.py        # ablation model factory
+```

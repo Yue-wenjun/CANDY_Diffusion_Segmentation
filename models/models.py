@@ -1,125 +1,164 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from models.diffusion import DiffusionModel
+
+# Keys that DiffusionModel.__init__ accepts; everything else is filtered out.
+_DIFFUSION_KEYS = {
+    "batch_size", "in_channel", "hidden_channel", "out_channel",
+    "input_size", "hidden_size", "T", "num_classes", "decoder_type",
+}
+
+
+def _diffusion_cfg(config: dict) -> dict:
+    return {k: v for k, v in config.items() if k in _DIFFUSION_KEYS}
+
 
 class DiffusionModelWrapper:
     def __init__(self, base_config):
         self.base_config = base_config
-        
-    def create_model(self, ablation_type, **kwargs):
-        """
-        根据消融类型和 config.py 传入的 override_config 创建模型变体
-        """
-        # 1. 基础配置合并 override 配置 (例如更换 decoder_type, 修改 T 等)
-        config = self.base_config.copy()
-        config.update(kwargs)
-        
-        # ==========================================
-        # 通用结构模型 (仅参数/模块替换，网络拓扑流向不变)
-        # ==========================================
-        standard_models = ["baseline", "segformer", "mobilevit", "adjust_steps"]
-        if ablation_type in standard_models:
-            return DiffusionModel(**config)
-            
-        # ==========================================
-        # 拓扑结构消融实验 (重写了 forward 逻辑的特殊变体)
-        # ==========================================
+
+    def create_model(self, ablation_type):
+        cfg = _diffusion_cfg(self.base_config)
+
+        # ── Standard variants: decoder swapped via decoder_type in config ──────
+        # "segformer"  → cfg["decoder_type"] == "segformer_b0"   (set in config.py)
+        # "mobilevit"  → cfg["decoder_type"] == "mobilevit_small"
+        # "baseline" / "adjust_steps" → decoder_type == "unet"
+        if ablation_type in ("baseline", "segformer", "mobilevit", "adjust_steps"):
+            return DiffusionModel(**cfg)
+
+        # ── Ablation: no skip connections ─────────────────────────────────────
         elif ablation_type == "no_skip":
             class NoSkipDiffusionModel(DiffusionModel):
                 def forward(self, x, graph_schedule=None):
                     device = x.device
-                    origin = torch.zeros(
-                        self.T, self.batch_size, self.in_channel, self.hidden_size, self.input_size
-                    ).to(device)
-                    input = x
-
+                    B = x.shape[0]
+                    feat = x
+                    t_idx = torch.zeros(B, dtype=torch.long, device=device)
                     for t in range(self.T):
-                        output = self.candies[t](input)
-                        origin[t] = input
-                        input = output
-
+                        feat = self.candies[t](feat)   # forward, no origin saved
                     if graph_schedule is None:
-                        graph_schedule = torch.linspace(0.7, 0.2, self.T).to(device)
-
-                    # 反向过程移除了跳跃连接与特征融合
+                        graph_schedule = torch.linspace(0.7, 0.2, self.T, device=device)
                     for t in reversed(range(self.T)):
-                        reverse_input = input  # 直接将上一步输出作为输入
-                        output = self.unets[t](reverse_input)
-                        input = output
+                        t_idx.fill_(t)
+                        feat = self.unet(feat, t_idx)  # no fusion, no skip
+                    return self.seg_head(feat)
 
-                    output_seg = self.seg_head(output)
-                    return torch.sum(output_seg, dim=1, keepdim=True)
-            
-            return NoSkipDiffusionModel(**config)
-            
+            return NoSkipDiffusionModel(**cfg)
+
+        # ── Ablation: replace CANDY with simple double-conv ───────────────────
         elif ablation_type == "simple_cnn":
             class SimpleCNNDiffusionModel(DiffusionModel):
-                def __init__(self, **model_cfg):
-                    super().__init__(**model_cfg)
-                    # 替换 CANDY 模块为简单的双层 CNN
+                def __init__(self, **c):
+                    super().__init__(**c)
+                    hc = c.get("hidden_channel", 16)
                     self.candies = nn.ModuleList([
                         nn.Sequential(
-                            nn.Conv2d(model_cfg.get("in_channel", 1), model_cfg.get("hidden_channel", 64), 
-                                     kernel_size=3, stride=1, padding=1),
-                            nn.ReLU(),
-                            nn.Conv2d(model_cfg.get("hidden_channel", 64), model_cfg.get("out_channel", 1), 
-                                     kernel_size=3, stride=1, padding=1)
+                            nn.Conv2d(c["in_channel"], hc, 3, padding=1),
+                            nn.ReLU(inplace=True),
+                            nn.Conv2d(hc, c["out_channel"], 3, padding=1),
                         )
-                        for _ in range(model_cfg["T"])
+                        for _ in range(c["T"])
                     ])
-            
-            return SimpleCNNDiffusionModel(**config)
-            
+
+            return SimpleCNNDiffusionModel(**cfg)
+
+        # ── Ablation: replace shared UNet with a single 1×1 conv ─────────────
         elif ablation_type == "simple_decoder":
             class SimpleDecoderDiffusionModel(DiffusionModel):
-                def __init__(self, **model_cfg):
-                    # 强行指定一个内部状态以绕过检查，下面立即覆盖 unets
-                    model_cfg["decoder_type"] = "simple_decoder" 
-                    super().__init__(**model_cfg)
-                    
-                    # 替换复杂 Decoder 为单层 1x1 卷积
-                    self.unets = nn.ModuleList([
-                        nn.Sequential(
-                            nn.Conv2d(model_cfg["in_channel"], model_cfg["out_channel"], kernel_size=1),
-                            nn.ReLU()
-                        )
-                        for _ in range(model_cfg["T"])
-                    ])
-            
-            return SimpleDecoderDiffusionModel(**config)
-            
+                def __init__(self, **c):
+                    super().__init__(**c)
+                    self.unet = nn.Sequential(
+                        nn.Conv2d(c["in_channel"], c["out_channel"], kernel_size=1),
+                        nn.ReLU(inplace=True),
+                    )
+
+                def forward(self, x, graph_schedule=None):
+                    device = x.device
+                    B = x.shape[0]
+                    origin = torch.zeros(
+                        self.T, B, self.in_channel, self.hidden_size, self.input_size, device=device
+                    )
+                    feat = x
+                    for t in range(self.T):
+                        origin[t] = feat
+                        feat = self.candies[t](feat)
+                    if graph_schedule is None:
+                        graph_schedule = torch.linspace(0.7, 0.2, self.T, device=device)
+                    for t in reversed(range(self.T)):
+                        fused = self.fusion_convs[t](torch.cat([feat, origin[t]], dim=1))
+                        reverse_input = (1 - graph_schedule[t]) * fused + graph_schedule[t] * origin[t]
+                        feat = self.unet(reverse_input)   # no t_idx: 1×1 conv ignores it
+                    return self.seg_head(feat)
+
+            return SimpleDecoderDiffusionModel(**cfg)
+
+        # ── Ablation: SDE — inject Gaussian noise in the forward pass ─────────
         elif ablation_type == "sde":
             class SDEDiffusionModel(DiffusionModel):
                 def forward(self, x, graph_schedule=None):
                     device = x.device
+                    B = x.shape[0]
                     origin = torch.zeros(
-                        self.T, self.batch_size, self.in_channel, self.hidden_size, self.input_size
-                    ).to(device)
-                    input = x
-
-                    # 前向扩散：注入随机噪声 (SDE 特性)
+                        self.T, B, self.in_channel, self.hidden_size, self.input_size, device=device
+                    )
+                    feat = x
                     for t in range(self.T):
-                        output = self.candies[t](input)
-                        noise = torch.randn_like(output) * 0.1  # 注入噪声
-                        output = output + noise
-                        origin[t] = input
-                        input = output
-
+                        origin[t] = feat
+                        feat = self.candies[t](feat) + torch.randn_like(feat) * 0.1
                     if graph_schedule is None:
-                        graph_schedule = torch.linspace(0.7, 0.2, self.T).to(device)
-
+                        graph_schedule = torch.linspace(0.7, 0.2, self.T, device=device)
+                    t_idx = torch.zeros(B, dtype=torch.long, device=device)
                     for t in reversed(range(self.T)):
-                        graph_factor = graph_schedule[t]
-                        # SDE 实验中使用了简化版的反向加权逻辑
-                        reverse_input = (1 - graph_factor) * input + graph_factor * origin[t]
-                        output = self.unets[t](reverse_input)
-                        input = output
+                        t_idx.fill_(t)
+                        fused = self.fusion_convs[t](torch.cat([feat, origin[t]], dim=1))
+                        reverse_input = (1 - graph_schedule[t]) * fused + graph_schedule[t] * origin[t]
+                        feat = self.unet(reverse_input, t_idx)
+                    return self.seg_head(feat)
 
-                    output_seg = self.seg_head(output)
-                    return torch.sum(output_seg, dim=1, keepdim=True)
-            
-            return SDEDiffusionModel(**config)
-            
+            return SDEDiffusionModel(**cfg)
+
+        # ── DDPM baseline: Gaussian forward process instead of CANDY ────────────
+        # Same shared UNet + fusion_convs + seg_head; only the forward chain changes.
+        # This tests whether CANDY's learned deterministic forward is better than
+        # standard DDPM Gaussian noise schedule.
+        elif ablation_type == "ddpm":
+            class DDPMDiffusionModel(DiffusionModel):
+                def __init__(self, **c):
+                    super().__init__(**c)
+                    T = c["T"]
+                    # Linear beta schedule (small values → mild noise for feature maps)
+                    betas = torch.linspace(1e-4, 2e-2, T)
+                    alphas_bar = torch.cumprod(1.0 - betas, dim=0)
+                    self.register_buffer("_sqrt_ab",     torch.sqrt(alphas_bar))
+                    self.register_buffer("_sqrt_1m_ab",  torch.sqrt(1.0 - alphas_bar))
+
+                def forward(self, x, graph_schedule=None):
+                    device = x.device
+                    B = x.shape[0]
+                    origin = torch.zeros(
+                        self.T, B, self.in_channel, self.hidden_size, self.input_size, device=device
+                    )
+                    feat = x
+                    for t in range(self.T):
+                        origin[t] = feat
+                        # q(x_t | x_0) = sqrt(ā_t)·x_0 + sqrt(1−ā_t)·ε
+                        feat = self._sqrt_ab[t] * feat + self._sqrt_1m_ab[t] * torch.randn_like(feat)
+                    if graph_schedule is None:
+                        graph_schedule = torch.linspace(0.7, 0.2, self.T, device=device)
+                    t_idx = torch.zeros(B, dtype=torch.long, device=device)
+                    for t in reversed(range(self.T)):
+                        t_idx.fill_(t)
+                        fused = self.fusion_convs[t](torch.cat([feat, origin[t]], dim=1))
+                        reverse_input = (1 - graph_schedule[t]) * fused + graph_schedule[t] * origin[t]
+                        feat = self.unet(reverse_input, t_idx)
+                    return self.seg_head(feat)
+
+            return DDPMDiffusionModel(**cfg)
+
         else:
-            raise ValueError(f"Unknown ablation type: {ablation_type}")
+            raise ValueError(
+                f"Unknown ablation type: '{ablation_type}'\n"
+                f"Available: baseline, segformer, mobilevit, adjust_steps, ddpm, "
+                f"no_skip, simple_cnn, simple_decoder, sde"
+            )
