@@ -90,10 +90,7 @@ def process_folder(raw_data_dir, raw_labels_dir, savediroimg, savedirmask, croph
         coordinates = crop_save(img_path, mask_path, savediroimg, savedirmask, croph, cropw, ratw, rath, alpha)
         if coordinates:
             all_coordinates.extend(coordinates)
-    
-    # Save all coordinate list
-    with open(os.path.join(savediroimg, 'point_list.pkl'), 'wb') as f:
-        pickle.dump(all_coordinates, f)
+
 
 if __name__ == '__main__':
     # Input folder paths
