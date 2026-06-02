@@ -30,7 +30,7 @@ def test_model(model_type, checkpoint_path=None, custom_steps=None, k_folds=1, f
         if k_folds > 1:
             # 推导 K折 的默认权重路径 (假设命名规则与 main.py 保持一致)
             base_name, ext = os.path.splitext(default_checkpoint)
-            checkpoint_path = f"{base_name}3_fold{fold}{ext}"
+            checkpoint_path = f"{base_name}_fold{fold}{ext}"
         else:
             checkpoint_path = default_checkpoint
 

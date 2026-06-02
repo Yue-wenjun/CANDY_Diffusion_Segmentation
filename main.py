@@ -72,7 +72,7 @@ class DiffusionCLI:
         # Adjust checkpoint path for k-fold
         base_checkpoint_path = checkpoint_path_template
         base_name, ext = os.path.splitext(base_checkpoint_path)
-        checkpoint_path = f"{base_name}3_fold{current_fold + 1}{ext}"
+        checkpoint_path = f"{base_name}_fold{current_fold + 1}{ext}"
 
         # Checkpoint handling
         checkpoint_dir = os.path.dirname(checkpoint_path)
