@@ -58,9 +58,7 @@ class DiffusionCLI:
         model = model_wrapper.create_model(model_type).to(self.device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
-        _dice = DiceLoss(sigmoid=True)
-        _bce = torch.nn.BCEWithLogitsLoss()
-        criterion = lambda pred, target: _dice(pred, target) + _bce(pred, target)
+        criterion = DiceLoss(sigmoid=True)
 
         steps_per_epoch = len(train_loader)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(

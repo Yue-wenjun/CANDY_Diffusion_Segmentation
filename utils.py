@@ -25,7 +25,7 @@ def plot_heatmap(data, extent, vmin, vmax, cmap='jet'):
     plt.show()
 
 def calculate_iou(y_true, y_pred):
-    y_pred = y_pred > 0
+    y_pred = y_pred > -1
     if y_true.sum() == 0:
         return 1.0
     jaccard = JaccardIndex(task="binary").to(y_true.device)
@@ -33,7 +33,7 @@ def calculate_iou(y_true, y_pred):
     return iou.item()
 
 def calculate_dice(y_true, y_pred):
-    y_pred = y_pred > 0
+    y_pred = y_pred > -1
     dice_metric = DiceScore(num_classes=2).to(y_true.device)
     dice_metric.update(y_pred, y_true)
     dice = dice_metric.compute()
@@ -86,7 +86,7 @@ def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20):
                     im = axes[2].imshow(y_pred_np, cmap='tab20b', vmin=-10, vmax=2)
                     axes[2].set_title("Predicted Logits", fontsize=35, pad=10); axes[2].axis('off')
                     fig.colorbar(im, ax=axes[2], orientation='vertical', fraction=0.046, pad=0.04).ax.tick_params(labelsize=22)
-                    binary_pred = (y_pred_np > 0).astype(float)
+                    binary_pred = (y_pred_np > -1).astype(float)
                     axes[3].imshow(binary_pred); axes[3].set_title("Binary Prediction", fontsize=35, pad=10); axes[3].axis('off')
 
                     img_path = os.path.join(save_dir, f"result_{batch_idx * batch_size + i + 1}.png")

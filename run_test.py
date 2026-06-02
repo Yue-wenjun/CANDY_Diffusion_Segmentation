@@ -27,7 +27,7 @@ CHECKPOINT_TEMPLATE = "checkpoint/{model}_fold{fold}_best.pth"
 TEST_CLEAN_DATA = True
 CLEAN_IMAGE_PATH = "cropped_images"
 
-NOISE_LEVELS = [0, 10, 20]
+NOISE_LEVELS = [0, 5, 10, 15, 20, 25, 30]
 IMAGE_PATH_TEMPLATE = "cropped_noised_data/cropped_noised_{db}dB"
 
 MASK_PATH = "cropped_masks"
