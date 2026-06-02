@@ -25,7 +25,7 @@ def plot_heatmap(data, extent, vmin, vmax, cmap='jet'):
     plt.show()
 
 def calculate_iou(y_true, y_pred):
-    y_pred = y_pred > -1
+    y_pred = y_pred > 0
     if y_true.sum() == 0:
         return 1.0
     jaccard = JaccardIndex(task="binary").to(y_true.device)
@@ -33,7 +33,7 @@ def calculate_iou(y_true, y_pred):
     return iou.item()
 
 def calculate_dice(y_true, y_pred):
-    y_pred = y_pred > -1
+    y_pred = y_pred > 0
     dice_metric = DiceScore(num_classes=2).to(y_true.device)
     dice_metric.update(y_pred, y_true)
     dice = dice_metric.compute()
@@ -46,16 +46,15 @@ def calculate_proportion(y_pred):
     return proportion
 
 
-def app(model, dataloader, device, batch_size, save_dir):
-    seg_loss = 0
+def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20):
     total_loss = 0
     total_iou = 0
     total_dice = 0
-    total_proportion = 0  # For tracking -1 to 1 proportion
+    total_proportion = 0
+    vis_saved = 0
 
     criterion = nn.BCEWithLogitsLoss()
 
-    # Load application data
     with torch.no_grad():
         for batch_idx, (images, masks) in enumerate(dataloader):
             images, masks = images.to(device), masks.to(device)
@@ -63,62 +62,37 @@ def app(model, dataloader, device, batch_size, save_dir):
                 continue
             output_seg = model(images)
 
-            seg_loss = criterion(output_seg, masks)
-            print(f"Batch Loss : {seg_loss.item()}")
-            total_loss += seg_loss.item()
+            total_loss += criterion(output_seg, masks).item()
 
             for i in range(batch_size):
-                # 🔴 修复 1: 补充批次维度 unsqueeze(0)，解决 TorchMetrics 维度报错
                 y_true = masks[i].unsqueeze(0)
                 y_pred = output_seg[i].unsqueeze(0)
 
-                # Calculate IoU, Dice
-                iou = calculate_iou(y_true, y_pred)
-                dice = calculate_dice(y_true, y_pred)
+                total_iou  += calculate_iou(y_true, y_pred)
+                total_dice += calculate_dice(y_true, y_pred)
 
-                # Accumulate metrics
-                total_iou += iou
-                total_dice += dice
-
-                # Visualization of predictions
-                y_true_np = masks[i].squeeze(0).cpu().detach().numpy()
                 y_pred_np = output_seg[i].squeeze(0).cpu().detach().numpy()
-                x_np = images[i].squeeze(0).cpu().detach().numpy()
+                total_proportion += np.mean((y_pred_np > -1) & (y_pred_np < 1))
 
-                # Calculate proportion of pixels between -1 and 1
-                mask_in_range = (y_pred_np > -1) & (y_pred_np < 1)
-                proportion = np.mean(mask_in_range)
-                total_proportion += proportion
+                # 只保存前 max_vis_samples 张可视化图，避免数万张 PNG 撑爆磁盘
+                if vis_saved < max_vis_samples:
+                    y_true_np = masks[i].squeeze(0).cpu().detach().numpy()
+                    x_np      = images[i].squeeze(0).cpu().detach().numpy()
 
-                # Create figure with 4 subplots
-                fig, axes = plt.subplots(1, 4, figsize=(26, 6), gridspec_kw={'width_ratios': [1, 1, 1.1, 1]})
+                    fig, axes = plt.subplots(1, 4, figsize=(26, 6),
+                                             gridspec_kw={'width_ratios': [1, 1, 1.1, 1]})
+                    axes[0].imshow(x_np);       axes[0].set_title("Input Image",       fontsize=35, pad=10); axes[0].axis('off')
+                    axes[1].imshow(y_true_np);  axes[1].set_title("Ground Truth",      fontsize=35, pad=10); axes[1].axis('off')
+                    im = axes[2].imshow(y_pred_np, cmap='tab20b', vmin=-10, vmax=2)
+                    axes[2].set_title("Predicted Logits", fontsize=35, pad=10); axes[2].axis('off')
+                    fig.colorbar(im, ax=axes[2], orientation='vertical', fraction=0.046, pad=0.04).ax.tick_params(labelsize=22)
+                    binary_pred = (y_pred_np > 0).astype(float)
+                    axes[3].imshow(binary_pred); axes[3].set_title("Binary Prediction", fontsize=35, pad=10); axes[3].axis('off')
 
-                # Original image
-                axes[0].imshow(x_np)
-                axes[0].set_title("Input Image", fontsize=35, pad=10)
-                axes[0].axis('off')
-
-                # Ground truth mask
-                axes[1].imshow(y_true_np)
-                axes[1].set_title("Ground Truth", fontsize=35, pad=10)
-                axes[1].axis('off')
-
-                # Predicted mask with fixed colorbar range
-                im = axes[2].imshow(y_pred_np, cmap='tab20b', vmin=-10, vmax=2)
-                axes[2].set_title("Predicted Logits", fontsize=35, pad=10)
-                axes[2].axis('off')
-                cbar = fig.colorbar(im, ax=axes[2], orientation='vertical', fraction=0.046, pad=0.04)
-                cbar.ax.tick_params(labelsize=22)
-
-                # 🔴 修复 2: 可视化画图时的二值化阈值也统一改为 -1
-                binary_pred = (y_pred_np > -1).astype(float)
-                axes[3].imshow(binary_pred)
-                axes[3].set_title("Binary Prediction", fontsize=35, pad=10)
-                axes[3].axis('off')
-
-                img_path = os.path.join(save_dir, f"result_{batch_idx * batch_size + i + 1}.png")
-                plt.savefig(img_path, bbox_inches='tight', dpi=300)
-                plt.close(fig)
+                    img_path = os.path.join(save_dir, f"result_{batch_idx * batch_size + i + 1}.png")
+                    plt.savefig(img_path, bbox_inches='tight', dpi=300)
+                    plt.close(fig)
+                    vis_saved += 1
 
             torch.cuda.empty_cache()
 

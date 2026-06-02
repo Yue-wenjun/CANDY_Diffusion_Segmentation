@@ -98,11 +98,6 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
     total_proportion = 0.0
     num_samples = 0
 
-    # 如果有检查点路径，则加载最佳模型
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        load_checkpoint(model, None, None, checkpoint_path)  # 验证时不需要加载优化器状态
-        print(f"Loaded best model from {checkpoint_path} for validation")
-
     with torch.no_grad():
         for batch_idx, (images, masks) in enumerate(dataloader):
             images, masks = images.to(device), masks.to(device)

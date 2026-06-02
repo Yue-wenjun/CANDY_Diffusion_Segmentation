@@ -21,13 +21,13 @@ K_FOLDS = 4
 ADJUST_STEPS_VAL = 5
 
 # 1. 权重路径配置
-CHECKPOINT_TEMPLATE = "checkpoint/{model}_fold{fold}.pth"
+CHECKPOINT_TEMPLATE = "checkpoint/{model}_fold{fold}_best.pth"
 
 # 2. 数据路径配置
 TEST_CLEAN_DATA = True
 CLEAN_IMAGE_PATH = "cropped_images"
 
-NOISE_LEVELS = [0, 5, 10, 15, 20, 25, 30]
+NOISE_LEVELS = [0, 10, 20]
 IMAGE_PATH_TEMPLATE = "cropped_noised_data/cropped_noised_{db}dB"
 
 MASK_PATH = "cropped_masks"
@@ -91,6 +91,17 @@ def run_all_tests():
     for condition_name, img_dir in test_conditions:
         if not os.path.exists(img_dir) or not os.path.exists(MASK_PATH):
             print(f"【跳过】找不到路径: {img_dir} 或 {MASK_PATH}")
+            continue
+
+        # 跳过该 condition 下已全部完成的情况，避免浪费 8 分钟数据加载
+        pending = [
+            (m, f) for m in MODELS_TO_TEST
+            for f in range(1, K_FOLDS + 1)
+            if (m, f, condition_name) not in done_keys
+            and os.path.exists(CHECKPOINT_TEMPLATE.format(model=m, fold=f))
+        ]
+        if not pending:
+            print(f"【已全部完成】{condition_name} 跳过数据加载")
             continue
 
         print(f"\n{'=' * 60}")

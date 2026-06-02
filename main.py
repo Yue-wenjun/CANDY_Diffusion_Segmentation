@@ -58,7 +58,9 @@ class DiffusionCLI:
         model = model_wrapper.create_model(model_type).to(self.device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
-        criterion = DiceLoss(sigmoid=True)
+        _dice = DiceLoss(sigmoid=True)
+        _bce = torch.nn.BCEWithLogitsLoss()
+        criterion = lambda pred, target: _dice(pred, target) + _bce(pred, target)
 
         steps_per_epoch = len(train_loader)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -80,8 +82,10 @@ class DiffusionCLI:
 
         print(checkpoint_path)
 
+        best_checkpoint_path = f"{base_name}_fold{current_fold + 1}_best{ext}"
+
         if os.path.exists(checkpoint_path):
-            start_epoch = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+            start_epoch, _ = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
             print(f"Loaded checkpoint: {checkpoint_path} (epoch {start_epoch})")
         else:
             start_epoch = 0
@@ -89,7 +93,8 @@ class DiffusionCLI:
 
         # Training phase
         print(f"\nTraining started (Total {num_epochs} epochs)...")
-        last_val_loss, last_iou, last_dice, last_proportion = None, None, None, None
+        best_iou = -1.0
+        best_val_loss, best_dice, best_proportion = None, None, None
         for epoch in range(start_epoch, start_epoch + num_epochs):
             start_time = time.time()
             train_loss = train(
@@ -109,19 +114,17 @@ class DiffusionCLI:
                 self.device,
                 BASE_CONFIG["batch_size"],
                 criterion,
-                checkpoint_path,
             )
             val_loss = val_metrics["loss"]
             iou = val_metrics["iou"]
             dice = val_metrics["dice"]
             proportion = val_metrics["proportion"]
 
-            last_val_loss, last_iou, last_dice, last_proportion = (
-                val_loss,
-                iou,
-                dice,
-                proportion,
-            )
+            if iou > best_iou:
+                best_iou = iou
+                best_val_loss, best_dice, best_proportion = val_loss, dice, proportion
+                save_checkpoint(model, optimizer, scheduler, epoch, best_checkpoint_path)
+                print(f"Best model updated (IoU={best_iou:.4f}) → {best_checkpoint_path}")
 
         # Testing phase (only for non-k-fold mode)
         if k_folds <= 1 and test_loader is not None:
@@ -142,7 +145,7 @@ class DiffusionCLI:
             print(f"\n=== Fold {current_fold + 1} completed ===")
             print(f"Final checkpoint: {checkpoint_path}")
 
-        return last_val_loss, last_iou, last_dice, last_proportion
+        return best_val_loss, best_iou, best_dice, best_proportion
 
     def run_kfold_cross_validation(
         self, model_type, num_epochs=1, custom_steps=None, k_folds=5
