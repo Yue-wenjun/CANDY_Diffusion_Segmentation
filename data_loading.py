@@ -40,7 +40,10 @@ class CustomDataset(Dataset):
         self.all_images = torch.zeros((num_samples, 1, 252, 252), dtype=torch.float32)
         self.all_masks = torch.zeros((num_samples, 1, 252, 252), dtype=torch.float32)
 
-        for i in tqdm(range(num_samples), desc="填充巨型 Tensor"):
+        milestones = {int(num_samples * p) for p in (0.25, 0.5, 0.75)}
+        for i in range(num_samples):
+            if i in milestones:
+                print(f"  {i}/{num_samples} ({100*i//num_samples}%)");
             img_path = os.path.join(self.image_dir, self.images[i])
             with rasterio.open(img_path) as src:
                 image = src.read()

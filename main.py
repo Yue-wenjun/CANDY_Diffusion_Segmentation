@@ -57,7 +57,7 @@ class DiffusionCLI:
         model_wrapper = DiffusionModelWrapper(config)
         model = model_wrapper.create_model(model_type).to(self.device)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+        optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=1e-4)
         criterion = DiceLoss(sigmoid=True)
 
         steps_per_epoch = len(train_loader)
@@ -255,17 +255,35 @@ if __name__ == "__main__":
         default=1,
         help="Number of folds for k-fold cross validation (default: 1, no cross validation)",
     )
+    parser.add_argument(
+        "-f",
+        "--fold",
+        type=int,
+        default=None,
+        help="Run a single specific fold (0-indexed). Requires -k. e.g. -k 4 -f 0 runs only fold 1.",
+    )
 
     args = parser.parse_args()
 
     # Parameter validation
     if args.model_type == "adjust_steps" and not args.steps:
         parser.error("adjust_steps requires -s parameter (e.g., -s 5)")
+    if args.fold is not None and args.kfolds <= 1:
+        parser.error("-f requires -k > 1")
 
     try:
         cli = DiffusionCLI()
 
-        if args.kfolds > 1:
+        if args.fold is not None:
+            # Run a single specified fold
+            cli.run_pipeline(
+                args.model_type,
+                num_epochs=args.epochs,
+                custom_steps=args.steps,
+                k_folds=args.kfolds,
+                current_fold=args.fold,
+            )
+        elif args.kfolds > 1:
             # Run k-fold cross validation
             cli.run_kfold_cross_validation(
                 args.model_type,

@@ -109,7 +109,7 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
             output_seg = model(images)
 
             # 计算损失
-            seg_loss = criterion(output_seg.squeeze(1), masks.squeeze(1))
+            seg_loss = criterion(output_seg, masks)
             total_loss += seg_loss.item()
 
             # 计算指标
