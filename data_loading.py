@@ -171,6 +171,12 @@ class _AugSubset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         img  = self.base.all_images[self.indices[i]]
         mask = self.base.all_masks[self.indices[i]]
+
+        # Log-transform then z-score: SAR amplitudes are log-normally distributed;
+        # log makes ship/sea contrast more stable across scenes.
+        img = torch.log1p(img.clamp(min=0))   # log(1+x), clamp guards against negatives from NaN fill
+        img = (img - img.mean()) / (img.std() + 1e-8)
+
         if self.augment:
             # Random 90° rotation (k=0,1,2,3)
             k = torch.randint(0, 4, (1,)).item()

@@ -4,7 +4,7 @@ import os
 from utils import calculate_proportion, calculate_iou, calculate_dice
 
 
-def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, checkpoint_path, criterion, save_interval=10):
+def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, checkpoint_path, criterion, save_interval=100):
     model.train()
     running_loss = 0.0
     batch_loss = 0.0
@@ -173,16 +173,18 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
     avg_proportion = total_proportion / num_samples if num_samples > 0 else 0
 
     # Print logit distribution for threshold diagnosis
-    if all_logits:
+    opt_iou_info = ""
+    if all_logits and all_fg_logits and all_bg_logits:
         all_logits_cat = torch.cat(all_logits)
+        fg_cat = torch.cat(all_fg_logits)
+        bg_cat = torch.cat(all_bg_logits)
         print(f"Logit stats: min={all_logits_cat.min():.3f}, max={all_logits_cat.max():.3f}, "
               f"mean={all_logits_cat.mean():.3f}, median={all_logits_cat.median():.3f}")
-        if all_fg_logits:
-            fg_cat = torch.cat(all_fg_logits)
-            print(f"  FG logits: mean={fg_cat.mean():.3f}, median={fg_cat.median():.3f}")
-        if all_bg_logits:
-            bg_cat = torch.cat(all_bg_logits)
-            print(f"  BG logits: mean={bg_cat.mean():.3f}, median={bg_cat.median():.3f}")
+        print(f"  FG logits: mean={fg_cat.mean():.3f}, median={fg_cat.median():.3f}")
+        print(f"  BG logits: mean={bg_cat.mean():.3f}, median={bg_cat.median():.3f}")
+        # Adaptive threshold: midpoint between FG and BG means
+        opt_thresh = ((fg_cat.mean() + bg_cat.mean()) / 2).item()
+        print(f"  Adaptive threshold (FG/BG midpoint): {opt_thresh:.3f}")
 
     print(f"Validation Results:")
     print(f"Average IoU: {avg_iou:.4f}")

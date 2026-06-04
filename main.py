@@ -13,12 +13,52 @@ from utils import app
 from config import BASE_CONFIG, get_config, ABLATION_REGISTRY
 
 
+def build_criterion(loss_spec: str, device):
+    """
+    Parse a loss spec string into a callable criterion.
+
+    Formats:
+      dice              → DiceLoss(sigmoid=True)
+      bce               → BCEWithLogitsLoss(pos_weight=10)
+      bce:N             → BCEWithLogitsLoss(pos_weight=N)
+      dice+bce:W        → DiceLoss + W * BCEWithLogitsLoss(pos_weight=10)
+      dice+bce:W:N      → DiceLoss + W * BCEWithLogitsLoss(pos_weight=N)
+    """
+    spec = loss_spec.strip().lower()
+
+    if spec == "dice":
+        return DiceLoss(sigmoid=True)
+
+    if spec.startswith("bce"):
+        parts = spec.split(":")
+        pw = float(parts[1]) if len(parts) > 1 else 10.0
+        return torch.nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pw], device=device)
+        )
+
+    if spec.startswith("dice+bce"):
+        parts = spec.split(":")
+        bce_w = float(parts[1]) if len(parts) > 1 else 0.2
+        pw    = float(parts[2]) if len(parts) > 2 else 10.0
+        _dice = DiceLoss(sigmoid=True)
+        _bce  = torch.nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pw], device=device)
+        )
+        return lambda pred, tgt: _dice(pred, tgt) + bce_w * _bce(pred, tgt)
+
+    raise ValueError(
+        f"Unknown loss spec '{loss_spec}'. "
+        "Use: dice | bce | bce:N | dice+bce:W | dice+bce:W:N"
+    )
+
+
 class DiffusionCLI:
     def __init__(self):
         self.device = torch.device("cuda")
 
     def run_pipeline(
-        self, model_type, num_epochs=1, custom_steps=None, k_folds=1, current_fold=0
+        self, model_type, num_epochs=1, custom_steps=None, k_folds=1, current_fold=0,
+        loss_spec="bce",
     ):
         # 1. 直接通过 config.py 获取所有参数
         config, checkpoint_path_template, save_dir = get_config(
@@ -58,7 +98,8 @@ class DiffusionCLI:
         model = model_wrapper.create_model(model_type).to(self.device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=1e-4)
-        criterion = DiceLoss(sigmoid=True)
+        criterion = build_criterion(loss_spec, self.device)
+        print(f"Loss: {loss_spec}")
 
         steps_per_epoch = len(train_loader)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -146,7 +187,7 @@ class DiffusionCLI:
         return best_val_loss, best_iou, best_dice, best_proportion
 
     def run_kfold_cross_validation(
-        self, model_type, num_epochs=1, custom_steps=None, k_folds=5
+        self, model_type, num_epochs=1, custom_steps=None, k_folds=5, loss_spec="bce"
     ):
         """Run k-fold cross validation"""
         print(f"\nStarting {k_folds}-Fold Cross Validation for {model_type} model")
@@ -168,6 +209,7 @@ class DiffusionCLI:
                     custom_steps=custom_steps,
                     k_folds=k_folds,
                     current_fold=fold,
+                    loss_spec=loss_spec,
                 )
 
                 # 保存结果
@@ -262,6 +304,20 @@ if __name__ == "__main__":
         default=None,
         help="Run a single specific fold (0-indexed). Requires -k. e.g. -k 4 -f 0 runs only fold 1.",
     )
+    parser.add_argument(
+        "-l",
+        "--loss",
+        type=str,
+        default="bce",
+        help=(
+            "Loss function spec (default: bce). Options:\n"
+            "  dice            → DiceLoss(sigmoid=True)\n"
+            "  bce             → BCEWithLogitsLoss(pos_weight=10)\n"
+            "  bce:N           → BCEWithLogitsLoss(pos_weight=N)\n"
+            "  dice+bce:W      → DiceLoss + W*BCE(pos_weight=10)\n"
+            "  dice+bce:W:N    → DiceLoss + W*BCE(pos_weight=N)\n"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -282,6 +338,7 @@ if __name__ == "__main__":
                 custom_steps=args.steps,
                 k_folds=args.kfolds,
                 current_fold=args.fold,
+                loss_spec=args.loss,
             )
         elif args.kfolds > 1:
             # Run k-fold cross validation
@@ -290,11 +347,13 @@ if __name__ == "__main__":
                 num_epochs=args.epochs,
                 custom_steps=args.steps,
                 k_folds=args.kfolds,
+                loss_spec=args.loss,
             )
         else:
             # Run standard pipeline
             cli.run_pipeline(
-                args.model_type, num_epochs=args.epochs, custom_steps=args.steps
+                args.model_type, num_epochs=args.epochs, custom_steps=args.steps,
+                loss_spec=args.loss,
             )
 
     except Exception as e:
