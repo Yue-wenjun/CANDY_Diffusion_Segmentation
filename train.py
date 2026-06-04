@@ -12,6 +12,9 @@ def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, che
     early_stop_threshold = 0.0002
     patience = 5
 
+    train_fg_logits = []
+    train_bg_logits = []
+
     for batch_idx, (images, masks) in enumerate(dataloader):
         images, masks = images.to(device), masks.to(device)
 
@@ -57,6 +60,18 @@ def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, che
         optimizer.step()
         scheduler.step()
 
+        # Collect train logit stats (sampled every 20 batches to stay cheap)
+        if batch_idx % 20 == 0:
+            with torch.no_grad():
+                lc = output_seg.detach().cpu().float()
+                mc = masks.detach().cpu().float()
+                fg = mc > 0.5
+                bg = ~fg
+                if fg.any():
+                    train_fg_logits.append(lc[fg].mean().item())
+                if bg.any():
+                    train_bg_logits.append(lc[bg].mean().item())
+
         running_loss += loss.item()
         batch_loss += loss.item()
 
@@ -82,6 +97,9 @@ def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, che
         #     break
 
     avg_loss = running_loss / len(dataloader)
+    if train_fg_logits and train_bg_logits:
+        print(f"Train logit stats: FG mean={sum(train_fg_logits)/len(train_fg_logits):.3f}, "
+              f"BG mean={sum(train_bg_logits)/len(train_bg_logits):.3f}")
     print(f"Epoch [{epoch}] Average Loss: {avg_loss}")
 
     # 保存每个epoch结束时的检查点
@@ -98,6 +116,10 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
     total_proportion = 0.0
     num_samples = 0
 
+    all_logits = []
+    all_fg_logits = []
+    all_bg_logits = []
+
     with torch.no_grad():
         for batch_idx, (images, masks) in enumerate(dataloader):
             images, masks = images.to(device), masks.to(device)
@@ -107,6 +129,17 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
                 continue
 
             output_seg = model(images)
+
+            # Collect logit statistics for diagnosis
+            logits_cpu = output_seg.cpu().float()
+            masks_cpu = masks.cpu().float()
+            all_logits.append(logits_cpu.flatten())
+            fg_mask = masks_cpu > 0.5
+            bg_mask = ~fg_mask
+            if fg_mask.any():
+                all_fg_logits.append(logits_cpu[fg_mask])
+            if bg_mask.any():
+                all_bg_logits.append(logits_cpu[bg_mask])
 
             # 计算损失
             seg_loss = criterion(output_seg, masks)
@@ -138,6 +171,18 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
     avg_dice = total_dice / num_samples if num_samples > 0 else 0
     avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
     avg_proportion = total_proportion / num_samples if num_samples > 0 else 0
+
+    # Print logit distribution for threshold diagnosis
+    if all_logits:
+        all_logits_cat = torch.cat(all_logits)
+        print(f"Logit stats: min={all_logits_cat.min():.3f}, max={all_logits_cat.max():.3f}, "
+              f"mean={all_logits_cat.mean():.3f}, median={all_logits_cat.median():.3f}")
+        if all_fg_logits:
+            fg_cat = torch.cat(all_fg_logits)
+            print(f"  FG logits: mean={fg_cat.mean():.3f}, median={fg_cat.median():.3f}")
+        if all_bg_logits:
+            bg_cat = torch.cat(all_bg_logits)
+            print(f"  BG logits: mean={bg_cat.mean():.3f}, median={bg_cat.median():.3f}")
 
     print(f"Validation Results:")
     print(f"Average IoU: {avg_iou:.4f}")

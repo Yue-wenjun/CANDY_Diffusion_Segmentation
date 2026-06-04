@@ -158,6 +158,36 @@ def get_test_only_dataloader(image_dir, mask_dir, batch_size=4, test_split=0.15)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
 
 
+class _AugSubset(torch.utils.data.Dataset):
+    """Wraps a CustomDataset subset with optional random flip augmentation."""
+    def __init__(self, base, indices, augment=False):
+        self.base    = base
+        self.indices = indices
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        img  = self.base.all_images[self.indices[i]]
+        mask = self.base.all_masks[self.indices[i]]
+        if self.augment:
+            # Random 90° rotation (k=0,1,2,3)
+            k = torch.randint(0, 4, (1,)).item()
+            if k > 0:
+                img  = torch.rot90(img,  k, dims=[-2, -1])
+                mask = torch.rot90(mask, k, dims=[-2, -1])
+            # Horizontal flip
+            if torch.rand(1).item() > 0.5:
+                img  = torch.flip(img,  dims=[-1])
+                mask = torch.flip(mask, dims=[-1])
+            # Vertical flip
+            if torch.rand(1).item() > 0.5:
+                img  = torch.flip(img,  dims=[-2])
+                mask = torch.flip(mask, dims=[-2])
+        return img, mask
+
+
 def get_kfold_dataloaders(image_dir, mask_dir, batch_size=4, n_splits=4, fold=0,
                           shuffle=True, save_split_path=None, test_ratio=0.15):
     """
@@ -198,11 +228,11 @@ def get_kfold_dataloaders(image_dir, mask_dir, batch_size=4, n_splits=4, fold=0,
         print(f"Fold {fold} val split saved to: {save_split_path}")
 
     train_loader = DataLoader(
-        torch.utils.data.Subset(dataset, train_indices),
+        _AugSubset(dataset, train_indices, augment=True),
         batch_size=batch_size, shuffle=shuffle, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
-        torch.utils.data.Subset(dataset, val_indices),
+        _AugSubset(dataset, val_indices, augment=False),
         batch_size=batch_size, shuffle=False, pin_memory=True,
     )
 
