@@ -8,10 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-from torchmetrics import JaccardIndex
-from torchmetrics.segmentation import DiceScore
-
-
 def plot_heatmap(data, extent, vmin, vmax, cmap='jet'):
     fig, ax = plt.subplots()
     heatmap = ax.imshow(data, vmin=vmin, vmax=vmax, cmap=cmap, extent=extent)
@@ -25,19 +21,22 @@ def plot_heatmap(data, extent, vmin, vmax, cmap='jet'):
     plt.show()
 
 def calculate_iou(y_true, y_pred):
-    y_pred = y_pred > -1
-    if y_true.sum() == 0:
-        return 1.0
-    jaccard = JaccardIndex(task="binary").to(y_true.device)
-    iou = jaccard(y_pred, y_true)
-    return iou.item()
+    y_pred = (y_pred > -1).float()
+    y_true = y_true.float()
+    intersection = (y_pred * y_true).sum()
+    union = y_pred.sum() + y_true.sum() - intersection
+    if union == 0:
+        return 1.0   # both empty → perfect
+    return (intersection / union).item()
 
 def calculate_dice(y_true, y_pred):
-    y_pred = y_pred > -1
-    dice_metric = DiceScore(num_classes=2).to(y_true.device)
-    dice_metric.update(y_pred, y_true)
-    dice = dice_metric.compute()
-    return dice.item()
+    y_pred = (y_pred > -1).float()
+    y_true = y_true.float()
+    intersection = (y_pred * y_true).sum()
+    denom = y_pred.sum() + y_true.sum()
+    if denom == 0:
+        return 1.0
+    return (2.0 * intersection / denom).item()
 
 def calculate_proportion(y_pred):
     y_pred_np = y_pred.cpu().numpy() if torch.is_tensor(y_pred) else y_pred

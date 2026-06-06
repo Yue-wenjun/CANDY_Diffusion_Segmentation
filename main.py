@@ -182,6 +182,8 @@ class DiffusionCLI:
             print(f"Final checkpoint: {checkpoint_path}")
         else:
             print(f"\n=== Fold {current_fold + 1} completed ===")
+            print(f"Best IoU: {best_iou:.4f}  Dice: {best_dice:.4f}")
+            print(f"Best checkpoint: {best_checkpoint_path}")
             print(f"Final checkpoint: {checkpoint_path}")
 
         return best_val_loss, best_iou, best_dice, best_proportion
