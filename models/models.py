@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from models.diffusion import DiffusionModel
+from models.segformer_b0 import SegFormerB0
+from models.mobilevit_small import MobileViTSmall
 
 # Keys that DiffusionModel.__init__ accepts; everything else is filtered out.
 _DIFFUSION_KEYS = {
@@ -156,9 +158,39 @@ class DiffusionModelWrapper:
 
             return DDPMDiffusionModel(**cfg)
 
+        # ── Pure baselines: no CANDY, no fusion — decoder only ───────────────
+        # Used to prove CANDY adds value over the backbone alone.
+        elif ablation_type == "pure_unet":
+            from models.unet import UNet
+            class PureUNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.unet = UNet(cfg["in_channel"], cfg["num_classes"], T=1)
+                def forward(self, x, graph_schedule=None):
+                    return self.unet(x)
+            return PureUNet()
+
+        elif ablation_type == "pure_segformer":
+            class PureSegFormer(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.model = SegFormerB0(cfg["in_channel"], cfg["num_classes"])
+                def forward(self, x, graph_schedule=None):
+                    return self.model(x)
+            return PureSegFormer()
+
+        elif ablation_type == "pure_mobilevit":
+            class PureMobileViT(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.model = MobileViTSmall(cfg["in_channel"], cfg["num_classes"])
+                def forward(self, x, graph_schedule=None):
+                    return self.model(x)
+            return PureMobileViT()
+
         else:
             raise ValueError(
                 f"Unknown ablation type: '{ablation_type}'\n"
                 f"Available: baseline, segformer, mobilevit, adjust_steps, ddpm, "
-                f"no_skip, simple_cnn, simple_decoder, sde"
+                f"no_skip, simple_cnn, simple_decoder, sde, pure_segformer, pure_mobilevit"
             )

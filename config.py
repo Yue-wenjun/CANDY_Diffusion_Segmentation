@@ -47,6 +47,24 @@ ABLATION_REGISTRY = {
         "save_dir": "./imgs/mobilevit",
         "override_config": {"decoder_type": "mobilevit_small"},  # 一键切换为 MobileViT
     },
+    # 【消融】纯解码器基线（无 CANDY 前向链）
+    "pure_unet": {
+        "checkpoint": "checkpoint/pure_unet.pth",
+        "save_dir": "./imgs/pure_unet",
+        "override_config": {},
+    },
+    # 【消融】纯 SegFormer / 纯 MobileViT（无 CANDY 前向链）
+    # 用于证明 CANDY 对 decoder 的增益
+    "pure_segformer": {
+        "checkpoint": "checkpoint/pure_segformer.pth",
+        "save_dir": "./imgs/pure_segformer",
+        "override_config": {},
+    },
+    "pure_mobilevit": {
+        "checkpoint": "checkpoint/pure_mobilevit.pth",
+        "save_dir": "./imgs/pure_mobilevit",
+        "override_config": {},
+    },
     "no_skip": {
         "checkpoint": "checkpoint/no_skip.pth",
         "save_dir": "./imgs/no_skip",

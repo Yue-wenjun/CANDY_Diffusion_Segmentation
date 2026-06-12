@@ -108,7 +108,7 @@ def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, che
     return avg_loss
 
 
-def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
+def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None, thresh=0.5, verbose=True):
     model.eval()
     total_loss = 0.0
     total_iou = 0.0
@@ -155,11 +155,11 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
                 y_pred = output_seg[i].unsqueeze(0)
 
                 # 计算IoU
-                iou = calculate_iou(y_true, y_pred)
+                iou = calculate_iou(y_true, y_pred, thresh=thresh)
                 total_iou += iou
 
                 # 计算Dice
-                dice = calculate_dice(y_true, y_pred)
+                dice = calculate_dice(y_true, y_pred, thresh=thresh)
                 total_dice += dice
 
                 # 计算proportion
@@ -172,25 +172,24 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None):
     avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
     avg_proportion = total_proportion / num_samples if num_samples > 0 else 0
 
-    # Print logit distribution for threshold diagnosis
-    opt_iou_info = ""
-    if all_logits and all_fg_logits and all_bg_logits:
-        all_logits_cat = torch.cat(all_logits)
-        fg_cat = torch.cat(all_fg_logits)
-        bg_cat = torch.cat(all_bg_logits)
-        print(f"Logit stats: min={all_logits_cat.min():.3f}, max={all_logits_cat.max():.3f}, "
-              f"mean={all_logits_cat.mean():.3f}, median={all_logits_cat.median():.3f}")
-        print(f"  FG logits: mean={fg_cat.mean():.3f}, median={fg_cat.median():.3f}")
-        print(f"  BG logits: mean={bg_cat.mean():.3f}, median={bg_cat.median():.3f}")
-        # Adaptive threshold: midpoint between FG and BG means
-        opt_thresh = ((fg_cat.mean() + bg_cat.mean()) / 2).item()
-        print(f"  Adaptive threshold (FG/BG midpoint): {opt_thresh:.3f}")
+    if verbose:
+        # Print logit distribution for threshold diagnosis
+        if all_logits and all_fg_logits and all_bg_logits:
+            all_logits_cat = torch.cat(all_logits)
+            fg_cat = torch.cat(all_fg_logits)
+            bg_cat = torch.cat(all_bg_logits)
+            print(f"Logit stats: min={all_logits_cat.min():.3f}, max={all_logits_cat.max():.3f}, "
+                  f"mean={all_logits_cat.mean():.3f}, median={all_logits_cat.median():.3f}")
+            print(f"  FG logits: mean={fg_cat.mean():.3f}, median={fg_cat.median():.3f}")
+            print(f"  BG logits: mean={bg_cat.mean():.3f}, median={bg_cat.median():.3f}")
+            opt_thresh = ((fg_cat.mean() + bg_cat.mean()) / 2).item()
+            print(f"  Adaptive threshold (FG/BG midpoint): {opt_thresh:.3f}")
 
-    print(f"Validation Results:")
-    print(f"Average IoU: {avg_iou:.4f}")
-    print(f"Average Dice: {avg_dice:.4f}")
-    print(f"Average Loss: {avg_loss:.4f}")
-    print(f"Average proportion of pixels between -1 and 1: {avg_proportion:.4f}")
+        print(f"Validation Results:")
+        print(f"Average IoU: {avg_iou:.4f}")
+        print(f"Average Dice: {avg_dice:.4f}")
+        print(f"Average Loss: {avg_loss:.4f}")
+        print(f"Average proportion of pixels between -1 and 1: {avg_proportion:.4f}")
 
     return {
         'loss': avg_loss,

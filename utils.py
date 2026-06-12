@@ -20,8 +20,8 @@ def plot_heatmap(data, extent, vmin, vmax, cmap='jet'):
     cbar = plt.colorbar(heatmap, cax=cax, orientation='horizontal', pad=-5)
     plt.show()
 
-def calculate_iou(y_true, y_pred):
-    y_pred = (y_pred > -1).float()
+def calculate_iou(y_true, y_pred, thresh=0.5):
+    y_pred = (y_pred > thresh).float()
     y_true = y_true.float()
     intersection = (y_pred * y_true).sum()
     union = y_pred.sum() + y_true.sum() - intersection
@@ -29,8 +29,8 @@ def calculate_iou(y_true, y_pred):
         return 1.0   # both empty → perfect
     return (intersection / union).item()
 
-def calculate_dice(y_true, y_pred):
-    y_pred = (y_pred > -1).float()
+def calculate_dice(y_true, y_pred, thresh=0.5):
+    y_pred = (y_pred > thresh).float()
     y_true = y_true.float()
     intersection = (y_pred * y_true).sum()
     denom = y_pred.sum() + y_true.sum()
@@ -85,7 +85,7 @@ def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20):
                     im = axes[2].imshow(y_pred_np, cmap='tab20b', vmin=-10, vmax=2)
                     axes[2].set_title("Predicted Logits", fontsize=35, pad=10); axes[2].axis('off')
                     fig.colorbar(im, ax=axes[2], orientation='vertical', fraction=0.046, pad=0.04).ax.tick_params(labelsize=22)
-                    binary_pred = (y_pred_np > -1).astype(float)
+                    binary_pred = (y_pred_np > 0.5).astype(float)
                     axes[3].imshow(binary_pred); axes[3].set_title("Binary Prediction", fontsize=35, pad=10); axes[3].axis('off')
 
                     img_path = os.path.join(save_dir, f"result_{batch_idx * batch_size + i + 1}.png")

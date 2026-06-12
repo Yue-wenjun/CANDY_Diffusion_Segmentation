@@ -44,7 +44,9 @@ def build_criterion(loss_spec: str, device):
         _bce  = torch.nn.BCEWithLogitsLoss(
             pos_weight=torch.tensor([pw], device=device)
         )
-        return lambda pred, tgt: _dice(pred, tgt) + bce_w * _bce(pred, tgt)
+        # BCE drives optimization (anchors logit scale), Dice is a shape regularizer.
+        # bce_w is the Dice weight; BCE weight is always 1 to keep loss on BCE scale.
+        return lambda pred, tgt: bce_w * _dice(pred, tgt) + _bce(pred, tgt)
 
     raise ValueError(
         f"Unknown loss spec '{loss_spec}'. "
@@ -58,12 +60,14 @@ class DiffusionCLI:
 
     def run_pipeline(
         self, model_type, num_epochs=1, custom_steps=None, k_folds=1, current_fold=0,
-        loss_spec="bce",
+        loss_spec="bce", lr=None,
     ):
         # 1. 直接通过 config.py 获取所有参数
         config, checkpoint_path_template, save_dir = get_config(
             model_type, custom_steps
         )
+        if lr is not None:
+            config["lr"] = lr
 
         print(f"\n=== Running {model_type} model ===")
         if model_type == "adjust_steps":
@@ -99,7 +103,7 @@ class DiffusionCLI:
 
         optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=1e-4)
         criterion = build_criterion(loss_spec, self.device)
-        print(f"Loss: {loss_spec}")
+        print(f"Loss: {loss_spec}  LR: {config['lr']}")
 
         steps_per_epoch = len(train_loader)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -113,7 +117,9 @@ class DiffusionCLI:
         # Adjust checkpoint path for k-fold
         base_checkpoint_path = checkpoint_path_template
         base_name, ext = os.path.splitext(base_checkpoint_path)
-        checkpoint_path = f"{base_name}_fold{current_fold + 1}{ext}"
+        # For adjust_steps, embed T in the name to avoid collisions across different step counts
+        step_suffix = f"_T{config['T']}" if model_type == "adjust_steps" else ""
+        checkpoint_path = f"{base_name}{step_suffix}_fold{current_fold + 1}{ext}"
 
         # Checkpoint handling
         checkpoint_dir = os.path.dirname(checkpoint_path)
@@ -121,7 +127,7 @@ class DiffusionCLI:
 
         print(checkpoint_path)
 
-        best_checkpoint_path = f"{base_name}_fold{current_fold + 1}_best{ext}"
+        best_checkpoint_path = f"{base_name}{step_suffix}_fold{current_fold + 1}_best{ext}"
 
         if os.path.exists(checkpoint_path):
             start_epoch, _ = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
@@ -188,8 +194,56 @@ class DiffusionCLI:
 
         return best_val_loss, best_iou, best_dice, best_proportion
 
+    def eval_thresh_sweep(
+        self, model_type, custom_steps=None, k_folds=1, current_fold=0,
+        loss_spec="bce", thresholds=None,
+    ):
+        """Evaluate a saved best checkpoint across a range of thresholds (no training)."""
+        if thresholds is None:
+            thresholds = [-5.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0]
+
+        config, checkpoint_path_template, _ = get_config(model_type, custom_steps)
+
+        if k_folds > 1:
+            _, val_loader = get_kfold_dataloaders(
+                "cropped_images", "cropped_masks",
+                BASE_CONFIG["batch_size"], n_splits=k_folds, fold=current_fold,
+            )
+        else:
+            _, val_loader, _ = get_dataloaders(
+                "cropped_images", "cropped_masks",
+                BASE_CONFIG["batch_size"], 0.05, 0.05,
+            )
+
+        model_wrapper = DiffusionModelWrapper(config)
+        model = model_wrapper.create_model(model_type).to(self.device)
+
+        base_name, ext = os.path.splitext(checkpoint_path_template)
+        step_suffix = f"_T{config['T']}" if model_type == "adjust_steps" else ""
+        best_ckpt = f"{base_name}{step_suffix}_fold{current_fold + 1}_best{ext}"
+
+        if not os.path.exists(best_ckpt):
+            print(f"No best checkpoint found: {best_ckpt}")
+            return
+
+        load_checkpoint(model, None, None, best_ckpt)
+        criterion = build_criterion(loss_spec, self.device)
+
+        print(f"\nThreshold sweep on {best_ckpt}")
+        print(f"{'Threshold':>12}  {'IoU':>8}  {'Dice':>8}")
+        print("-" * 36)
+        best_t, best_iou = thresholds[0], -1.0
+        for t in thresholds:
+            m = val(model, val_loader, self.device, BASE_CONFIG["batch_size"],
+                    criterion, thresh=t, verbose=False)
+            marker = " ←" if m["iou"] > best_iou else ""
+            if m["iou"] > best_iou:
+                best_iou, best_t = m["iou"], t
+            print(f"{t:>12.2f}  {m['iou']:>8.4f}  {m['dice']:>8.4f}{marker}")
+        print(f"\nBest threshold: {best_t:.2f}  IoU={best_iou:.4f}")
+
     def run_kfold_cross_validation(
-        self, model_type, num_epochs=1, custom_steps=None, k_folds=5, loss_spec="bce"
+        self, model_type, num_epochs=1, custom_steps=None, k_folds=5, loss_spec="bce", lr=None,
     ):
         """Run k-fold cross validation"""
         print(f"\nStarting {k_folds}-Fold Cross Validation for {model_type} model")
@@ -212,6 +266,7 @@ class DiffusionCLI:
                     k_folds=k_folds,
                     current_fold=fold,
                     loss_spec=loss_spec,
+                    lr=lr,
                 )
 
                 # 保存结果
@@ -321,6 +376,18 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument(
+        "--eval-thresh",
+        action="store_true",
+        help="Sweep thresholds on the saved best checkpoint (no training).",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Override learning rate (default: use config). Use ~5e-5 for dice+bce to fix scale mismatch.",
+    )
+
     args = parser.parse_args()
 
     # Parameter validation
@@ -332,7 +399,16 @@ if __name__ == "__main__":
     try:
         cli = DiffusionCLI()
 
-        if args.fold is not None:
+        if args.eval_thresh:
+            fold = args.fold if args.fold is not None else 0
+            cli.eval_thresh_sweep(
+                args.model_type,
+                custom_steps=args.steps,
+                k_folds=args.kfolds,
+                current_fold=fold,
+                loss_spec=args.loss,
+            )
+        elif args.fold is not None:
             # Run a single specified fold
             cli.run_pipeline(
                 args.model_type,
@@ -341,6 +417,7 @@ if __name__ == "__main__":
                 k_folds=args.kfolds,
                 current_fold=args.fold,
                 loss_spec=args.loss,
+                lr=args.lr,
             )
         elif args.kfolds > 1:
             # Run k-fold cross validation
@@ -350,12 +427,13 @@ if __name__ == "__main__":
                 custom_steps=args.steps,
                 k_folds=args.kfolds,
                 loss_spec=args.loss,
+                lr=args.lr,
             )
         else:
             # Run standard pipeline
             cli.run_pipeline(
                 args.model_type, num_epochs=args.epochs, custom_steps=args.steps,
-                loss_spec=args.loss,
+                loss_spec=args.loss, lr=args.lr,
             )
 
     except Exception as e:

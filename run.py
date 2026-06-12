@@ -1,8 +1,75 @@
+import argparse
+import os
 import subprocess
-import time
 import datetime
-import traceback  # 确保在文件开头导入这个模块
+import time
+import traceback
 from config import BASE_CONFIG
+
+
+def run_ablation_sweep(model_types, epochs=10, k_folds=4, fold=0, loss_spec="bce", lr=None):
+    """
+    Load data once, train each model in-process for `epochs` epochs, print IoU table.
+    Usage: python run.py --ablation [-e N] [-k K] [-f F] [-l LOSS]
+    """
+    import torch
+    from config import get_config
+    from models.models import DiffusionModelWrapper
+    from data_loading import get_kfold_dataloaders
+    from train import train, val, save_checkpoint
+    from main import build_criterion
+
+    print(f"\nLoading data (fold {fold + 1}/{k_folds})...")
+    train_loader, val_loader = get_kfold_dataloaders(
+        "cropped_images", "cropped_masks",
+        BASE_CONFIG["batch_size"], n_splits=k_folds, fold=fold,
+    )
+    device = torch.device("cuda")
+    criterion = build_criterion(loss_spec, device)
+    results = {}
+
+    for model_type in model_types:
+        print(f"\n{'=' * 50}")
+        print(f"Ablation: {model_type}  epochs={epochs}  loss={loss_spec}")
+        print(f"{'=' * 50}")
+
+        config, ckpt_template, _ = get_config(model_type, None)
+        if lr is not None:
+            config["lr"] = lr
+
+        model = DiffusionModelWrapper(config).create_model(model_type).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=config["lr"],
+            steps_per_epoch=len(train_loader), epochs=epochs, pct_start=0.1,
+        )
+
+        base_name, ext = os.path.splitext(ckpt_template)
+        best_ckpt = f"{base_name}_fold{fold + 1}_best{ext}"
+        os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
+
+        best_iou = -1.0
+        for epoch in range(epochs):
+            train(model, train_loader, optimizer, scheduler, device, epoch,
+                  BASE_CONFIG["batch_size"], best_ckpt, criterion)
+            m = val(model, val_loader, device, BASE_CONFIG["batch_size"],
+                    criterion, verbose=False)
+            if m["iou"] > best_iou:
+                best_iou = m["iou"]
+                save_checkpoint(model, optimizer, scheduler, epoch, best_ckpt)
+            print(f"  epoch {epoch + 1}/{epochs}  IoU={m['iou']:.4f}  best={best_iou:.4f}")
+
+        results[model_type] = best_iou
+        del model, optimizer, scheduler
+        torch.cuda.empty_cache()
+
+    print(f"\n{'=' * 50}")
+    print(f"Ablation summary  loss={loss_spec}  epochs={epochs}  fold={fold + 1}")
+    print(f"{'=' * 50}")
+    print(f"{'Model':<22} {'Best IoU':>10}")
+    print("-" * 34)
+    for mt, iou in sorted(results.items(), key=lambda x: -x[1]):
+        print(f"{mt:<22} {iou:>10.4f}")
 
 
 def run_model(model_name, epochs=10, k_folds=4, steps=None):
@@ -46,65 +113,58 @@ def run_model(model_name, epochs=10, k_folds=4, steps=None):
         process.wait()
 
 
+ABLATION_MODELS = [
+    # CANDY + decoder
+    "baseline",          # CANDY + UNet
+    "segformer",         # CANDY + SegFormer
+    "mobilevit",         # CANDY + MobileViT
+    # Pure decoder (no CANDY) — proves CANDY adds value
+    "pure_unet",
+    "pure_segformer",
+    "pure_mobilevit",
+]
+
+SEQUENTIAL_MODELS = [
+    # "mobilevit",
+    "baseline",
+    # "adjust_steps",
+]
+
+
 def main():
-    # 定义要运行的模型列表
-    models_to_run = [
-        # "mobilevit",  # 基础模型
-        "baseline"
-        # "adjust_steps",  # 调整步数的模型（需要steps参数）
-        # "simple_decoder",  # 其他模型
-        # "simple_cnn",
-        # "sde",
-        # "no_skip"
-    ]
+    parser = argparse.ArgumentParser(description="run.py — training launcher")
+    parser.add_argument(
+        "--ablation", action="store_true",
+        help="Run ablation sweep (data loaded once, all models in-process)",
+    )
+    parser.add_argument("-e", "--epochs", type=int, default=BASE_CONFIG["epochs"])
+    parser.add_argument("-k", "--kfolds", type=int, default=BASE_CONFIG["k_folds"])
+    parser.add_argument("-f", "--fold",   type=int, default=0)
+    parser.add_argument("-l", "--loss",   type=str, default="bce")
+    args = parser.parse_args()
 
-    # 设置公共参数
-    EPOCHS = BASE_CONFIG["epochs"]
-    K_FOLDS = BASE_CONFIG["k_folds"]
+    if args.ablation:
+        run_ablation_sweep(
+            ABLATION_MODELS, epochs=args.epochs, k_folds=args.kfolds,
+            fold=args.fold, loss_spec=args.loss,
+        )
+        return
 
-    # 记录总开始时间
+    # ── Sequential subprocess runs ─────────────────────────────────────────────
     total_start = datetime.datetime.now()
     print(f"总开始时间: {total_start.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 依次运行每个模型
-    for model in models_to_run:
+    for model in SEQUENTIAL_MODELS:
         try:
-            if model == "adjust_steps":
-                # 特殊模型：可以设置steps参数
-                run_model(model, epochs=EPOCHS, k_folds=K_FOLDS, steps=5)
-            else:
-                # 普通模型
-                run_model(model, epochs=EPOCHS, k_folds=K_FOLDS)
-
-            # 模型之间添加短暂延迟
+            steps = 5 if model == "adjust_steps" else None
+            run_model(model, epochs=args.epochs, k_folds=args.kfolds, steps=steps)
             time.sleep(2)
-
-
-        # ... 你的其他代码 ...
-
         except Exception as e:
-            print(f"\n{'=' * 40}")
-            print(f"运行模型 {model} 时出错: {e}")
-            print("详细的报错堆栈信息如下：")
-            print(f"{'=' * 40}")
-
-            # 这行代码会打印出完整的报错路径，精确到哪一个文件的哪一行
+            print(f"\n运行模型 {model} 时出错: {e}")
             traceback.print_exc()
 
-            print(f"{'=' * 40}\n")
-        # except Exception as e:
-        #     print(f"运行模型 {model} 时出错: {e}")
-        #     # 可以选择继续或停止
-        #     # break
-
-    # 计算总运行时间
     total_end = datetime.datetime.now()
-    total_time = total_end - total_start
-    print(f"\n{'=' * 60}")
-    print(f"所有模型运行完成!")
-    print(f"总结束时间: {total_end.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"总运行时间: {total_time}")
-    print(f"{'=' * 60}")
+    print(f"\n所有模型运行完成!  总运行时间: {total_end - total_start}")
 
 
 if __name__ == "__main__":
