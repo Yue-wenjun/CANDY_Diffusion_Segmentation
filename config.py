@@ -47,6 +47,12 @@ ABLATION_REGISTRY = {
         "save_dir": "./imgs/mobilevit",
         "override_config": {"decoder_type": "mobilevit_small"},  # 一键切换为 MobileViT
     },
+    # 【消融】CANDY 激活函数对比
+    "baseline_tanh": {
+        "checkpoint": "checkpoint/baseline_tanh.pth",
+        "save_dir": "./imgs/baseline_tanh",
+        "override_config": {"candy_activation": "tanh"},
+    },
     # 【消融】纯解码器基线（无 CANDY 前向链）
     "pure_unet": {
         "checkpoint": "checkpoint/pure_unet.pth",

@@ -8,6 +8,7 @@ from models.mobilevit_small import MobileViTSmall
 _DIFFUSION_KEYS = {
     "batch_size", "in_channel", "hidden_channel", "out_channel",
     "input_size", "hidden_size", "T", "num_classes", "decoder_type",
+    "candy_activation",
 }
 
 
@@ -26,7 +27,7 @@ class DiffusionModelWrapper:
         # "segformer"  → cfg["decoder_type"] == "segformer_b0"   (set in config.py)
         # "mobilevit"  → cfg["decoder_type"] == "mobilevit_small"
         # "baseline" / "adjust_steps" → decoder_type == "unet"
-        if ablation_type in ("baseline", "segformer", "mobilevit", "adjust_steps"):
+        if ablation_type in ("baseline", "baseline_tanh", "segformer", "mobilevit", "adjust_steps"):
             return DiffusionModel(**cfg)
 
         # ── Ablation: no skip connections ─────────────────────────────────────
@@ -191,6 +192,6 @@ class DiffusionModelWrapper:
         else:
             raise ValueError(
                 f"Unknown ablation type: '{ablation_type}'\n"
-                f"Available: baseline, segformer, mobilevit, adjust_steps, ddpm, "
-                f"no_skip, simple_cnn, simple_decoder, sde, pure_segformer, pure_mobilevit"
+                f"Available: baseline, baseline_tanh, segformer, mobilevit, adjust_steps, ddpm, "
+                f"no_skip, simple_cnn, simple_decoder, sde, pure_unet, pure_segformer, pure_mobilevit"
             )

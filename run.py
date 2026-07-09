@@ -114,11 +114,13 @@ def run_model(model_name, epochs=10, k_folds=4, steps=None):
 
 
 ABLATION_MODELS = [
-    # CANDY + decoder
+    # CANDY + decoder (hardtanh post-act)
     "baseline",          # CANDY + UNet
     "segformer",         # CANDY + SegFormer
     "mobilevit",         # CANDY + MobileViT
-    # Pure decoder (no CANDY) — proves CANDY adds value
+    # CANDY + UNet with tanh post-act
+    "baseline_tanh",
+    # Pure decoder (no CANDY)
     "pure_unet",
     "pure_segformer",
     "pure_mobilevit",

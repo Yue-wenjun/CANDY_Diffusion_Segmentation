@@ -25,6 +25,7 @@ class DiffusionModel(nn.Module):
         T,
         num_classes,
         decoder_type="unet",
+        candy_activation="hardtanh",
         **kwargs,          # absorb extra config keys (lr, epochs, test_data_dir, …)
     ):
         super(DiffusionModel, self).__init__()
@@ -36,7 +37,8 @@ class DiffusionModel(nn.Module):
 
         # T independent CANDYs: each step learns a different forward transformation (~315K each, cheap)
         self.candies = nn.ModuleList([
-            CANDY(batch_size, in_channel, hidden_channel, out_channel, input_size, hidden_size)
+            CANDY(batch_size, in_channel, hidden_channel, out_channel, input_size, hidden_size,
+                  activation=candy_activation)
             for _ in range(T)
         ])
 

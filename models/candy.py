@@ -9,7 +9,7 @@ class CustomActivation(nn.Module):
 
 
 class CANDY(nn.Module):
-    def __init__(self, batch_size, in_channel, hidden_channel, out_channel, input_size, hidden_size):
+    def __init__(self, batch_size, in_channel, hidden_channel, out_channel, input_size, hidden_size, activation="hardtanh"):
         super(CANDY, self).__init__()
         self.batch_size   = batch_size    # kept for API compat; forward uses x.shape[0]
         self.input_size   = input_size
@@ -23,10 +23,10 @@ class CANDY(nn.Module):
 
         self.p_mask = nn.Parameter(torch.randn(hidden_size, input_size))
 
+        _act = nn.Tanh if activation == "tanh" else CustomActivation
         self.p_output_layer = nn.Sequential(
-            CustomActivation(),
             nn.Linear(input_size, input_size),
-            CustomActivation(),
+            _act(),
         )
 
         # Wp is stored as strictly lower-triangular (diagonal = 0).
@@ -35,9 +35,8 @@ class CANDY(nn.Module):
         self.Wp_diag = nn.Parameter(torch.zeros(hidden_size))   # softplus → positive diagonal
 
         self.z_output_layer = nn.Sequential(
-            CustomActivation(),
             nn.Linear(input_size, input_size),
-            CustomActivation(),
+            _act(),
         )
         self.Wzp = nn.Parameter(torch.randn(hidden_size, hidden_size))
 

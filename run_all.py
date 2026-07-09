@@ -25,22 +25,26 @@ from utils import app
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-EPOCHS  = BASE_CONFIG["epochs"]
+EPOCHS  = 70
 K_FOLDS = BASE_CONFIG["k_folds"]
 
 TRAIN_MODELS = [
-    "baseline", "segformer", "mobilevit", "no_skip",
-    "simple_cnn", "simple_decoder", "sde", "adjust_steps", "ddpm",
+    # CANDY + decoder variants
+    "baseline", "baseline_tanh",
+    "segformer", "mobilevit",
+    # Pure decoder baselines (no CANDY)
+    "pure_unet", "pure_segformer", "pure_mobilevit",
+    # Structural ablations
+    "no_skip", "simple_cnn", "simple_decoder", "sde", "adjust_steps", "ddpm",
 ]
 
 # Noise robustness: only these models
 NOISE_TEST_MODELS = ["baseline", "adjust_steps", "segformer", "mobilevit", "ddpm"]
 
-NOISE_LEVELS     = [0, 5, 10, 15, 20, 25, 30]
+NOISE_LEVELS     = [0, 10, 20]
 CLEAN_IMAGE_PATH = "cropped_images"
 NOISE_PATH_TPL   = "cropped_noised_data/cropped_noised_{db}dB"
 MASK_PATH        = "cropped_masks"
-CHECKPOINT_TPL   = "checkpoint/{model}_fold{fold}_best.pth"
 ADJUST_STEPS_VAL = 5
 
 OUTPUT_ROOT     = "noise_test_results"
@@ -186,7 +190,8 @@ def phase_test():
                 if key in done_keys:
                     continue
 
-                ckpt = CHECKPOINT_TPL.format(model=model_type, fold=fold)
+                step_suffix = f"_T{ADJUST_STEPS_VAL}" if model_type == "adjust_steps" else ""
+                ckpt = f"checkpoint/{model_type}{step_suffix}_fold{fold}_best.pth"
                 if not os.path.exists(ckpt):
                     _log(f"[SKIP] no checkpoint: {ckpt}")
                     continue
