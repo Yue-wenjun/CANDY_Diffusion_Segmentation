@@ -8,6 +8,7 @@ Results  → noise_test_results/results.csv  (append-safe, resumes on re-run)
 Training → best_folds.json + log.txt
 """
 
+import argparse
 import subprocess
 import datetime
 import json
@@ -89,6 +90,11 @@ def parse_best_fold(output):
     return best_fold
 
 
+def _ckpt_path(model, fold):
+    step_suffix = f"_T{ADJUST_STEPS_VAL}" if model == "adjust_steps" else ""
+    return f"checkpoint/{model}{step_suffix}_fold{fold}_best.pth"
+
+
 def _csv_path():
     return os.path.join(OUTPUT_ROOT, CSV_FILENAME)
 
@@ -115,14 +121,18 @@ def _save_csv(results):
 
 # ── Phase 1: Training ─────────────────────────────────────────────────────────
 
-def phase_train():
-    best_folds = {}
+def _load_best_folds():
     try:
         with open(BEST_FOLDS_PATH) as f:
             best_folds = json.load(f)
         _log(f"Loaded existing best_folds: {best_folds}")
+        return best_folds
     except FileNotFoundError:
-        pass
+        return {}
+
+
+def phase_train():
+    best_folds = _load_best_folds()
 
     for model in TRAIN_MODELS:
         if model in best_folds:
@@ -169,7 +179,7 @@ def phase_test():
             (m, f) for m in models_for_cond
             for f in range(1, K_FOLDS + 1)
             if (m, f, condition_name) not in done_keys
-            and os.path.exists(CHECKPOINT_TPL.format(model=m, fold=f))
+            and os.path.exists(_ckpt_path(m, f))
         ]
         if not pending:
             _log(f"[SKIP] {condition_name}: all done")
@@ -190,8 +200,7 @@ def phase_test():
                 if key in done_keys:
                     continue
 
-                step_suffix = f"_T{ADJUST_STEPS_VAL}" if model_type == "adjust_steps" else ""
-                ckpt = f"checkpoint/{model_type}{step_suffix}_fold{fold}_best.pth"
+                ckpt = _ckpt_path(model_type, fold)
                 if not os.path.exists(ckpt):
                     _log(f"[SKIP] no checkpoint: {ckpt}")
                     continue
@@ -226,11 +235,26 @@ def phase_test():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Full pipeline: Phase 1 (train) + Phase 2/3 (test).",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--skip-train",
+        action="store_true",
+        help="Skip Phase 1 entirely; run testing only against existing checkpoints.",
+    )
+    args = parser.parse_args()
+
     t0 = datetime.datetime.now()
     _log(f"run_all.py started — {t0:%Y-%m-%d %H:%M:%S}")
     _log(f"Models: {TRAIN_MODELS}  Epochs: {EPOCHS}  K-folds: {K_FOLDS}")
 
-    best_folds = phase_train()
+    if args.skip_train:
+        _log("[SKIP] Phase 1 — testing only (--skip-train)")
+        best_folds = _load_best_folds()
+    else:
+        best_folds = phase_train()
     phase_test()
 
     elapsed = datetime.datetime.now() - t0

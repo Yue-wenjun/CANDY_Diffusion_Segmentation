@@ -1,0 +1,40 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+candy_env/
+
+# ── Model weights & split records ─────────────────────────────────────────────
+# checkpoint/ also holds *_fold{N}_val_files.json written next to each .pth
+checkpoint/
+*.pth
+
+# ── Training / testing outputs ────────────────────────────────────────────────
+# imgs/{model} — config.py save_dir
+imgs/
+# run_all.py + run_test.py OUTPUT_ROOT
+noise_test_results/
+# run_all.py phase_train state
+best_folds.json
+# run_all.py _log
+log.txt
+results.csv
+多折多噪声测试指标汇总.csv
+
+# ── Datasets ──────────────────────────────────────────────────────────────────
+raw_data/
+cropped_images/
+cropped_masks/
+cropped_noised_data/
+# noise.py writes noised_data_{snr}dB/ to the repo root
+noised_data_*dB/
+# noise/ holds the *.mat noise definitions
+noise/
+*.mat
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
