@@ -15,19 +15,29 @@ import json
 import re
 import time
 import os
+import shutil
 import torch
 import csv
 
 from config import BASE_CONFIG, get_config
 from models.models import DiffusionModelWrapper
 from data_loading import get_test_only_dataloader
-from train import load_checkpoint
 from utils import app
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 EPOCHS  = 70
 K_FOLDS = BASE_CONFIG["k_folds"]
+
+# Loss for Phase 1 training. Passed to main.py via -l.
+#   "bce:25.2"     → measured pos_weight = bg/fg over cropped_masks (fg = 3.81%).
+#                    Replaces the old guessed 10, which only compensated ~9% fg and
+#                    left the decision boundary stuck at logit ~-2.
+#                    NOTE: masks also contain a stray value 4.0 (treated as
+#                    background). If inspect_mask_values.py says 4.0 is foreground,
+#                    use the "4.0 as foreground" pos_weight it prints instead.
+#   "dice"         → imbalance-robust but was unstable in earlier runs.
+LOSS_SPEC = "bce:25.2"
 
 TRAIN_MODELS = [
     # CANDY + decoder variants
@@ -50,7 +60,10 @@ ADJUST_STEPS_VAL = 5
 
 OUTPUT_ROOT     = "noise_test_results"
 CSV_FILENAME    = "results.csv"
-CSV_FIELDS      = ["Model", "Fold", "Condition", "Loss", "IoU", "Dice", "Proportion"]
+# IoU/Dice are foreground-only (empty-GT excluded), at the val-frozen threshold.
+# IoU_BestOnTest is the leaky best-on-test ceiling, kept only as a diagnostic.
+CSV_FIELDS      = ["Model", "Fold", "Condition", "Loss", "IoU", "Dice", "Proportion",
+                   "Best_Thresh", "IoU_BestOnTest", "Empty_FP_Rate"]
 BEST_FOLDS_PATH = "best_folds.json"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -119,6 +132,33 @@ def _save_csv(results):
         w.writerows(results)
 
 
+def archive_stale_artifacts():
+    """Move prior-run artifacts aside so training starts from a clean slate.
+
+    Renames (never deletes) into _archive_<timestamp>/ so the old BCE run stays
+    recoverable. This is what makes --fresh safe: with the old checkpoints gone,
+    run_pipeline can't silently RESUME them (which overran OneCycleLR and, worse,
+    would have kept training the old weights instead of the new loss).
+    """
+    stamp   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive = f"_archive_{stamp}"
+    targets = [BEST_FOLDS_PATH, "checkpoint", _csv_path()]
+
+    moved = []
+    for t in targets:
+        if os.path.exists(t):
+            os.makedirs(archive, exist_ok=True)
+            dest = os.path.join(archive, os.path.basename(os.path.normpath(t)))
+            shutil.move(t, dest)
+            moved.append((t, dest))
+
+    if moved:
+        for src, dest in moved:
+            _log(f"[FRESH] archived {src}  ->  {dest}")
+    else:
+        _log("[FRESH] nothing to archive (already clean)")
+
+
 # ── Phase 1: Training ─────────────────────────────────────────────────────────
 
 def _load_best_folds():
@@ -141,7 +181,8 @@ def phase_train():
 
         _log(f"{'='*60}\nTRAIN: {model}\n{'='*60}")
         try:
-            output = run_cmd(["python", "main.py", model, "-e", str(EPOCHS), "-k", str(K_FOLDS)])
+            output = run_cmd(["python", "main.py", model, "-e", str(EPOCHS),
+                              "-k", str(K_FOLDS), "-l", LOSS_SPEC])
             bf = parse_best_fold(output)
             best_folds[model] = bf
             _log(f">>> {model}: best fold = {bf}")
@@ -207,12 +248,16 @@ def phase_test():
 
                 _log(f"TEST: {model_type}  fold={fold}  @ {condition_name}")
                 model = DiffusionModelWrapper(config).create_model(model_type).to(device)
-                load_checkpoint(model, None, None, ckpt)
+                # Load weights + the val-frozen decision threshold in one read.
+                ckpt_data  = torch.load(ckpt, map_location=device)
+                model.load_state_dict(ckpt_data["model_state_dict"])
+                frozen_t   = ckpt_data.get("best_thresh")   # None for legacy checkpoints
                 model.eval()
 
                 save_dir = os.path.join(OUTPUT_ROOT, model_type, f"fold{fold}_{condition_name}")
                 os.makedirs(save_dir, exist_ok=True)
-                metrics = app(model, test_loader, device, BASE_CONFIG["batch_size"], save_dir)
+                metrics = app(model, test_loader, device, BASE_CONFIG["batch_size"], save_dir,
+                              thresh=frozen_t)
 
                 del model
                 torch.cuda.empty_cache()
@@ -222,10 +267,13 @@ def phase_test():
                         "Model":      model_type,
                         "Fold":       fold,
                         "Condition":  condition_name,
-                        "Loss":       metrics["loss"],
-                        "IoU":        metrics["iou"],
-                        "Dice":       metrics["dice"],
-                        "Proportion": metrics["proportion"],
+                        "Loss":          metrics["loss"],
+                        "IoU":           metrics["iou"],
+                        "Dice":          metrics["dice"],
+                        "Proportion":    metrics["proportion"],
+                        "Best_Thresh":    metrics["best_thresh"],
+                        "IoU_BestOnTest": metrics["iou_best_on_test"],
+                        "Empty_FP_Rate":  metrics["empty_fp_rate"],
                     })
                     done_keys.add(key)
                     _save_csv(results)
@@ -244,16 +292,29 @@ def main():
         action="store_true",
         help="Skip Phase 1 entirely; run testing only against existing checkpoints.",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Archive prior best_folds/checkpoints/results into _archive_<ts>/ and "
+             "retrain everything from scratch. Use this when changing the loss (e.g. "
+             "bce -> bce:25.2) so nothing resumes stale weights.",
+    )
     args = parser.parse_args()
+
+    if args.fresh and args.skip_train:
+        parser.error("--fresh and --skip-train are mutually exclusive.")
 
     t0 = datetime.datetime.now()
     _log(f"run_all.py started — {t0:%Y-%m-%d %H:%M:%S}")
-    _log(f"Models: {TRAIN_MODELS}  Epochs: {EPOCHS}  K-folds: {K_FOLDS}")
+    _log(f"Models: {TRAIN_MODELS}  Epochs: {EPOCHS}  K-folds: {K_FOLDS}  Loss: {LOSS_SPEC}")
 
     if args.skip_train:
         _log("[SKIP] Phase 1 — testing only (--skip-train)")
         best_folds = _load_best_folds()
     else:
+        if args.fresh:
+            _log(f"[FRESH] clean-slate retrain with loss '{LOSS_SPEC}'")
+            archive_stale_artifacts()
         best_folds = phase_train()
     phase_test()
 

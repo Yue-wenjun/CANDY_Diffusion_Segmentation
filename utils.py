@@ -45,39 +45,80 @@ def calculate_proportion(y_pred):
     return proportion
 
 
-def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20):
-    total_loss = 0
-    total_iou = 0
-    total_dice = 0
-    total_proportion = 0
-    vis_saved = 0
+# Logit thresholds swept during evaluation. 0.0 == sigmoid(logit) > 0.5.
+# Spans the old imbalanced-BCE regime (boundary ~-2) and the corrected regime
+# (boundary ~0 once pos_weight compensates the imbalance), finer near 0.
+EVAL_THRESHOLDS = [-6.0, -4.0, -3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]
 
-    criterion = nn.BCEWithLogitsLoss()
+
+def evaluate_segmentation(model, dataloader, device, batch_size,
+                          criterion=None, save_dir=None, max_vis_samples=0,
+                          thresholds=None):
+    """Single source of truth for the IoU/Dice metric, shared by val() and app().
+
+    - IoU/Dice are FOREGROUND-ONLY: images with an empty GT mask are excluded
+      entirely (not scored 0 or 1). Their spurious firing is reported separately
+      as empty_fp_rate.
+    - The threshold sweep is vectorised on-device (accumulators stay on GPU,
+      synced once at the end) so calling it every epoch in val() is cheap.
+    Returns raw per-threshold curves; callers decide which threshold to report.
+    """
+    if thresholds is None:
+        thresholds = EVAL_THRESHOLDS
+    model.eval()
+
+    T = torch.tensor(thresholds, device=device).view(-1, 1, 1, 1)   # [K,1,1,1]
+    K = len(thresholds)
+    fg_iou_sum  = torch.zeros(K, device=device)
+    fg_dice_sum = torch.zeros(K, device=device)
+    empty_fp    = torch.zeros(K, device=device)
+    fg_logit_sum = torch.zeros((), device=device); fg_logit_n = torch.zeros((), device=device)
+    bg_logit_sum = torch.zeros((), device=device); bg_logit_n = torch.zeros((), device=device)
+    fg_count, empty_count = 0, 0
+    total_loss, total_proportion = 0.0, 0.0
+    vis_saved = 0
 
     with torch.no_grad():
         for batch_idx, (images, masks) in enumerate(dataloader):
             images, masks = images.to(device), masks.to(device)
             if images.size(0) < batch_size:
                 continue
-            output_seg = model(images)
+            logits = model(images)                       # [B,1,H,W]
+            if criterion is not None:
+                total_loss += criterion(logits, masks).item()
 
-            total_loss += criterion(output_seg, masks).item()
+            # Class-conditional logit means (for the adaptive-threshold diagnostic).
+            fgm = masks > 0.5
+            bgm = ~fgm
+            fg_logit_sum += logits[fgm].sum(); fg_logit_n += fgm.sum()
+            bg_logit_sum += logits[bgm].sum(); bg_logit_n += bgm.sum()
+
+            # Per-image gt sums, moved to CPU once per batch to branch cheaply.
+            gt_sums = masks.sum(dim=(1, 2, 3))
+            nonempty = (gt_sums > 0).tolist()
 
             for i in range(batch_size):
-                y_true = masks[i].unsqueeze(0)
-                y_pred = output_seg[i].unsqueeze(0)
+                gt = masks[i]                            # [1,H,W]
+                pred = (logits[i].unsqueeze(0) > T).float()          # [K,1,H,W]
+                if nonempty[i]:
+                    fg_count += 1
+                    gt_sum = gt_sums[i]
+                    inter = (pred * gt).sum(dim=(1, 2, 3))           # [K]
+                    psum  = pred.sum(dim=(1, 2, 3))                  # [K]
+                    union = psum + gt_sum - inter
+                    denom = psum + gt_sum
+                    fg_iou_sum  += torch.where(union > 0, inter / union, torch.ones_like(inter))
+                    fg_dice_sum += torch.where(denom > 0, 2.0 * inter / denom, torch.ones_like(inter))
+                else:
+                    empty_count += 1
+                    empty_fp += pred.flatten(1).any(dim=1).float()  # [K]
 
-                total_iou  += calculate_iou(y_true, y_pred)
-                total_dice += calculate_dice(y_true, y_pred)
+                y_pred_np = logits[i].squeeze(0).cpu().detach().numpy()
+                total_proportion += float(np.mean((y_pred_np > -1) & (y_pred_np < 1)))
 
-                y_pred_np = output_seg[i].squeeze(0).cpu().detach().numpy()
-                total_proportion += np.mean((y_pred_np > -1) & (y_pred_np < 1))
-
-                # 只保存前 max_vis_samples 张可视化图，避免数万张 PNG 撑爆磁盘
-                if vis_saved < max_vis_samples:
+                if save_dir and vis_saved < max_vis_samples:
                     y_true_np = masks[i].squeeze(0).cpu().detach().numpy()
                     x_np      = images[i].squeeze(0).cpu().detach().numpy()
-
                     fig, axes = plt.subplots(1, 4, figsize=(26, 6),
                                              gridspec_kw={'width_ratios': [1, 1, 1.1, 1]})
                     axes[0].imshow(x_np);       axes[0].set_title("Input Image",       fontsize=35, pad=10); axes[0].axis('off')
@@ -85,9 +126,8 @@ def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20):
                     im = axes[2].imshow(y_pred_np, cmap='tab20b', vmin=-10, vmax=2)
                     axes[2].set_title("Predicted Logits", fontsize=35, pad=10); axes[2].axis('off')
                     fig.colorbar(im, ax=axes[2], orientation='vertical', fraction=0.046, pad=0.04).ax.tick_params(labelsize=22)
-                    binary_pred = (y_pred_np > 0.5).astype(float)
+                    binary_pred = (y_pred_np > 0.0).astype(float)
                     axes[3].imshow(binary_pred); axes[3].set_title("Binary Prediction", fontsize=35, pad=10); axes[3].axis('off')
-
                     img_path = os.path.join(save_dir, f"result_{batch_idx * batch_size + i + 1}.png")
                     plt.savefig(img_path, bbox_inches='tight', dpi=300)
                     plt.close(fig)
@@ -95,22 +135,76 @@ def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20):
 
             torch.cuda.empty_cache()
 
-    # Calculate average metrics
-    num_samples = len(dataloader.dataset)
-    avg_iou = total_iou / num_samples
-    avg_dice = total_dice / num_samples
-    avg_loss = total_loss / len(dataloader)
-    avg_proportion = total_proportion / num_samples
+    n = fg_count + empty_count
+    fg_iou  = {t: (fg_iou_sum[k]  / fg_count).item() if fg_count else float("nan")
+               for k, t in enumerate(thresholds)}
+    fg_dice = {t: (fg_dice_sum[k] / fg_count).item() if fg_count else float("nan")
+               for k, t in enumerate(thresholds)}
+    fp_rate = {t: (empty_fp[k] / empty_count).item() if empty_count else float("nan")
+               for k, t in enumerate(thresholds)}
+    fg_lm = (fg_logit_sum / fg_logit_n).item() if fg_logit_n > 0 else float("nan")
+    bg_lm = (bg_logit_sum / bg_logit_n).item() if bg_logit_n > 0 else float("nan")
 
-    print(f"Average IoU: {avg_iou}")
-    print(f"Average Dice: {avg_dice}")
-    print(f"Average Loss : {avg_loss}")
-    print(f"Average proportion of pixels between -1 and 1: {avg_proportion}")
-
-    # 🔴 修复 3: 返回计算指标，确保外部能写入 CSV 文件
     return {
-        'loss': avg_loss,
-        'iou': avg_iou,
-        'dice': avg_dice,
-        'proportion': avg_proportion
+        'thresholds':   list(thresholds),
+        'fg_iou':       fg_iou,
+        'fg_dice':      fg_dice,
+        'empty_fp_rate': fp_rate,
+        'fg_count':     fg_count,
+        'empty_count':  empty_count,
+        'loss':         total_loss / len(dataloader) if (criterion is not None and len(dataloader)) else float("nan"),
+        'proportion':   total_proportion / n if n else float("nan"),
+        'fg_logit_mean': fg_lm,
+        'bg_logit_mean': bg_lm,
+        'adaptive_thresh': (fg_lm + bg_lm) / 2,   # nan-safe: nan if either mean undefined
+    }
+
+
+def pick_best_threshold(res):
+    """Threshold maximising foreground IoU over the swept grid (val-side use).
+    Ties broken toward the HIGHER threshold: same IoU but fewer false positives
+    on empty-GT images (higher threshold ⇒ less over-prediction)."""
+    thr = res['thresholds']
+    if res['fg_count'] == 0:
+        return float("nan")
+    return max(thr, key=lambda t: (res['fg_iou'][t], t))
+
+
+def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20, thresh=None):
+    """Test-time evaluation. `thresh` is the FROZEN threshold chosen on validation
+    (no leakage). If None (e.g. legacy checkpoint), fall back to the best-on-test
+    threshold, which is an optimistic diagnostic ceiling — logged as such."""
+    res = evaluate_segmentation(model, dataloader, device, batch_size,
+                                criterion=nn.BCEWithLogitsLoss(),
+                                save_dir=save_dir, max_vis_samples=max_vis_samples)
+
+    if res['fg_count'] == 0:
+        print("[WARN] no foreground images in this test set — IoU undefined")
+        return {'loss': res['loss'], 'iou': float("nan"), 'dice': float("nan"),
+                'proportion': res['proportion'], 'best_thresh': float("nan"),
+                'iou_best_on_test': float("nan"), 'empty_fp_rate': float("nan")}
+
+    best_on_test = pick_best_threshold(res)          # diagnostic ceiling (leaky)
+    if thresh is None:
+        report_t = best_on_test
+        print("[WARN] no frozen val threshold given — reporting best-on-test "
+              f"(t={report_t:+.1f}), which is an optimistic upper bound.")
+    else:
+        # Snap the frozen threshold to the nearest swept grid point.
+        report_t = min(res['thresholds'], key=lambda t: abs(t - thresh))
+
+    print(f"Average Loss : {res['loss']}")
+    print(f"[FG-only, n={res['fg_count']}] report@t={report_t:+.1f}: "
+          f"IoU={res['fg_iou'][report_t]:.4f}  Dice={res['fg_dice'][report_t]:.4f}  "
+          f"empty-FP={res['empty_fp_rate'][report_t]:.3f}   "
+          f"(best-on-test t={best_on_test:+.1f}, IoU={res['fg_iou'][best_on_test]:.4f})")
+
+    return {
+        'loss':             res['loss'],
+        'iou':              res['fg_iou'][report_t],   # FG-only at the FROZEN val threshold
+        'dice':             res['fg_dice'][report_t],
+        'proportion':       res['proportion'],
+        'best_thresh':      report_t,
+        'iou_best_on_test': res['fg_iou'][best_on_test],
+        'empty_fp_rate':    res['empty_fp_rate'][report_t],
     }

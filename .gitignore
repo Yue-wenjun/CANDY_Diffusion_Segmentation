@@ -18,6 +18,8 @@ imgs/
 noise_test_results/
 # run_all.py phase_train state
 best_folds.json
+# run_all.py --fresh archives prior runs here
+_archive_*/
 # run_all.py _log
 log.txt
 results.csv

@@ -7,7 +7,7 @@ from monai.losses import DiceLoss
 from models.models import DiffusionModelWrapper
 from data_loading import get_dataloaders, get_kfold_dataloaders
 from train import train, val, save_checkpoint, load_checkpoint
-from utils import app
+from utils import app, evaluate_segmentation
 
 # 【引入配置】
 from config import BASE_CONFIG, get_config, ABLATION_REGISTRY
@@ -163,13 +163,16 @@ class DiffusionCLI:
             val_loss = val_metrics["loss"]
             iou = val_metrics["iou"]
             dice = val_metrics["dice"]
-            proportion = val_metrics["proportion"]
+            proportion = val_metrics.get("proportion")
+            best_thresh = val_metrics["best_thresh"]
 
             if iou > best_iou:
                 best_iou = iou
                 best_val_loss, best_dice, best_proportion = val_loss, dice, proportion
-                save_checkpoint(model, optimizer, scheduler, epoch, best_checkpoint_path)
-                print(f"Best model updated (IoU={best_iou:.4f}) → {best_checkpoint_path}")
+                save_checkpoint(model, optimizer, scheduler, epoch, best_checkpoint_path,
+                                best_thresh=best_thresh)
+                print(f"Best model updated (FG-IoU={best_iou:.4f} @ t={best_thresh:+.1f}) "
+                      f"→ {best_checkpoint_path}")
 
         # Testing phase (only for non-k-fold mode)
         if k_folds <= 1 and test_loader is not None:
@@ -229,18 +232,19 @@ class DiffusionCLI:
         load_checkpoint(model, None, None, best_ckpt)
         criterion = build_criterion(loss_spec, self.device)
 
-        print(f"\nThreshold sweep on {best_ckpt}")
-        print(f"{'Threshold':>12}  {'IoU':>8}  {'Dice':>8}")
-        print("-" * 36)
-        best_t, best_iou = thresholds[0], -1.0
+        # One evaluation pass produces the whole FG-only IoU/Dice curve.
+        res = evaluate_segmentation(model, val_loader, self.device,
+                                    BASE_CONFIG["batch_size"], criterion=criterion,
+                                    thresholds=thresholds)
+        print(f"\nThreshold sweep on {best_ckpt}  (FG-only, n={res['fg_count']})")
+        print(f"{'Threshold':>12}  {'IoU':>8}  {'Dice':>8}  {'empty-FP':>9}")
+        print("-" * 46)
+        best_t = max(thresholds, key=lambda t: res['fg_iou'][t])
         for t in thresholds:
-            m = val(model, val_loader, self.device, BASE_CONFIG["batch_size"],
-                    criterion, thresh=t, verbose=False)
-            marker = " ←" if m["iou"] > best_iou else ""
-            if m["iou"] > best_iou:
-                best_iou, best_t = m["iou"], t
-            print(f"{t:>12.2f}  {m['iou']:>8.4f}  {m['dice']:>8.4f}{marker}")
-        print(f"\nBest threshold: {best_t:.2f}  IoU={best_iou:.4f}")
+            marker = " ←" if t == best_t else ""
+            print(f"{t:>12.2f}  {res['fg_iou'][t]:>8.4f}  {res['fg_dice'][t]:>8.4f}  "
+                  f"{res['empty_fp_rate'][t]:>9.3f}{marker}")
+        print(f"\nBest threshold: {best_t:.2f}  IoU={res['fg_iou'][best_t]:.4f}")
 
     def run_kfold_cross_validation(
         self, model_type, num_epochs=1, custom_steps=None, k_folds=5, loss_spec="bce", lr=None,

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import os
-from utils import calculate_proportion, calculate_iou, calculate_dice
+from utils import evaluate_segmentation, pick_best_threshold
 
 
 def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, checkpoint_path, criterion, save_interval=100):
@@ -108,105 +108,46 @@ def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, che
     return avg_loss
 
 
-def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None, thresh=0.5, verbose=True):
-    model.eval()
-    total_loss = 0.0
-    total_iou = 0.0
-    total_dice = 0.0
-    total_proportion = 0.0
-    num_samples = 0
+def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None, thresh=None, verbose=True):
+    # Delegates to the shared metric so val and test are guaranteed identical:
+    # foreground-only IoU/Dice, swept thresholds. The best-IoU threshold on THIS
+    # validation set is returned as 'best_thresh' and later frozen for test.
+    res = evaluate_segmentation(model, dataloader, device, batch_size, criterion=criterion)
 
-    all_logits = []
-    all_fg_logits = []
-    all_bg_logits = []
-
-    with torch.no_grad():
-        for batch_idx, (images, masks) in enumerate(dataloader):
-            images, masks = images.to(device), masks.to(device)
-
-            # 跳过不完整的批次
-            if images.size(0) < batch_size:
-                continue
-
-            output_seg = model(images)
-
-            # Collect logit statistics for diagnosis
-            logits_cpu = output_seg.cpu().float()
-            masks_cpu = masks.cpu().float()
-            all_logits.append(logits_cpu.flatten())
-            fg_mask = masks_cpu > 0.5
-            bg_mask = ~fg_mask
-            if fg_mask.any():
-                all_fg_logits.append(logits_cpu[fg_mask])
-            if bg_mask.any():
-                all_bg_logits.append(logits_cpu[bg_mask])
-
-            # 计算损失
-            seg_loss = criterion(output_seg, masks)
-            total_loss += seg_loss.item()
-
-            # 计算指标
-            batch_size_current = images.size(0)
-            num_samples += batch_size_current
-
-            # 对每个样本单独计算指标
-            for i in range(batch_size_current):
-                y_true = masks[i].unsqueeze(0)  # 保持批次维度
-                y_pred = output_seg[i].unsqueeze(0)
-
-                # 计算IoU
-                iou = calculate_iou(y_true, y_pred, thresh=thresh)
-                total_iou += iou
-
-                # 计算Dice
-                dice = calculate_dice(y_true, y_pred, thresh=thresh)
-                total_dice += dice
-
-                # 计算proportion
-                proportion = calculate_proportion(y_pred)
-                total_proportion += proportion
-
-    # 计算平均指标
-    avg_iou = total_iou / num_samples if num_samples > 0 else 0
-    avg_dice = total_dice / num_samples if num_samples > 0 else 0
-    avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
-    avg_proportion = total_proportion / num_samples if num_samples > 0 else 0
+    best_t   = pick_best_threshold(res)
+    if res['fg_count'] == 0:
+        avg_iou = avg_dice = 0.0
+        best_t = 0.0
+    else:
+        avg_iou  = res['fg_iou'][best_t]
+        avg_dice = res['fg_dice'][best_t]
 
     if verbose:
-        # Print logit distribution for threshold diagnosis
-        if all_logits and all_fg_logits and all_bg_logits:
-            all_logits_cat = torch.cat(all_logits)
-            fg_cat = torch.cat(all_fg_logits)
-            bg_cat = torch.cat(all_bg_logits)
-            print(f"Logit stats: min={all_logits_cat.min():.3f}, max={all_logits_cat.max():.3f}, "
-                  f"mean={all_logits_cat.mean():.3f}, median={all_logits_cat.median():.3f}")
-            print(f"  FG logits: mean={fg_cat.mean():.3f}, median={fg_cat.median():.3f}")
-            print(f"  BG logits: mean={bg_cat.mean():.3f}, median={bg_cat.median():.3f}")
-            opt_thresh = ((fg_cat.mean() + bg_cat.mean()) / 2).item()
-            print(f"  Adaptive threshold (FG/BG midpoint): {opt_thresh:.3f}")
-
-        print(f"Validation Results:")
-        print(f"Average IoU: {avg_iou:.4f}")
-        print(f"Average Dice: {avg_dice:.4f}")
-        print(f"Average Loss: {avg_loss:.4f}")
-        print(f"Average proportion of pixels between -1 and 1: {avg_proportion:.4f}")
+        print(f"  FG logit mean={res['fg_logit_mean']:.3f}  BG logit mean={res['bg_logit_mean']:.3f}  "
+              f"adaptive(midpoint)={res['adaptive_thresh']:.3f}")
+        print(f"Validation [FG-only, n={res['fg_count']}]: "
+              f"IoU={avg_iou:.4f}  Dice={avg_dice:.4f}  Loss={res['loss']:.4f}  "
+              f"best_thresh={best_t:+.1f}  empty-FP={res['empty_fp_rate'].get(best_t, float('nan')):.3f}")
 
     return {
-        'loss': avg_loss,
-        'iou': avg_iou,
+        'loss': res['loss'],
+        'iou': avg_iou,            # FG-only IoU at the val-optimal threshold
         'dice': avg_dice,
-        'proportion': avg_proportion
+        'proportion': res['proportion'],
+        'best_thresh': best_t,     # frozen and applied at test time (no leakage)
     }
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, checkpoint_path, batch_idx=None):
+def save_checkpoint(model, optimizer, scheduler, epoch, checkpoint_path, batch_idx=None, best_thresh=None):
     # 确保目录存在
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
 
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
-        "batch_idx": batch_idx
+        "batch_idx": batch_idx,
+        # Val-selected decision threshold, frozen here and reused at test time.
+        "best_thresh": best_thresh,
     }
 
     if optimizer is not None:
