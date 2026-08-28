@@ -72,7 +72,7 @@ def run_all_tests():
     device = torch.device("cuda")
 
     print(f"\n{'=' * 60}")
-    print(f"🚀 开始一键多折测试 (包含原图与多噪声鲁棒性) 🚀")
+    print(f"开始一键多折测试 (包含原图与多噪声鲁棒性)")
     print(f"测试模型: {MODELS_TO_TEST}")
     print(f"包含干净数据: {TEST_CLEAN_DATA}")
     print(f"噪声等级: {NOISE_LEVELS} dB")
@@ -105,7 +105,7 @@ def run_all_tests():
             continue
 
         print(f"\n{'=' * 60}")
-        print(f"📂 加载数据集: {condition_name}  ({img_dir})")
+        print(f"加载数据集: {condition_name}  ({img_dir})")
         test_loader = get_test_only_dataloader(
             img_dir, MASK_PATH, BASE_CONFIG["batch_size"]
         )
@@ -160,7 +160,7 @@ def run_all_tests():
                     print(f">>> CSV 已保存 ({len(all_results)} 条): {_csv_path()}")
 
     print(f"\n{'=' * 60}")
-    print(f"🎉 所有测试完成！结果: {_csv_path()}")
+    print(f"所有测试完成！结果: {_csv_path()}")
     print(f"{'=' * 60}")
 
 

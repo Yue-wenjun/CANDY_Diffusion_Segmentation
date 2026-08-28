@@ -171,6 +171,11 @@ class DiffusionModelWrapper:
                     return self.unet(x)
             return PureUNet()
 
+        # ── Literature baseline: exact U-Net of Zheng et al. 2024 (GRL) ──────
+        elif ablation_type == "zheng_baseline":
+            from models.zheng_unet import ZhengUNet
+            return ZhengUNet(cfg["in_channel"], cfg["num_classes"])
+
         elif ablation_type == "pure_segformer":
             class PureSegFormer(nn.Module):
                 def __init__(self):
@@ -193,5 +198,6 @@ class DiffusionModelWrapper:
             raise ValueError(
                 f"Unknown ablation type: '{ablation_type}'\n"
                 f"Available: baseline, baseline_tanh, segformer, mobilevit, adjust_steps, ddpm, "
-                f"no_skip, simple_cnn, simple_decoder, sde, pure_unet, pure_segformer, pure_mobilevit"
+                f"no_skip, simple_cnn, simple_decoder, sde, pure_unet, pure_segformer, pure_mobilevit, "
+                f"zheng_baseline"
             )

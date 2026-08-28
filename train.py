@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 import os
-from utils import evaluate_segmentation, pick_best_threshold
+from utils import evaluate_segmentation, pick_best_threshold, center_crop_pair
 
 
-def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, checkpoint_path, criterion, save_interval=100):
+def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, checkpoint_path, criterion, save_interval=100, center_crop=None):
     model.train()
     running_loss = 0.0
     batch_loss = 0.0
@@ -33,6 +33,9 @@ def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, che
         if torch.isnan(output_seg).any():
             print(f"NaN detected in model output at batch {batch_idx}")
             continue
+
+        # Zheng et al. 2024 协议: 损失只算中心 center_crop×center_crop 区域
+        output_seg, masks = center_crop_pair(output_seg, masks, center_crop)
 
         loss = criterion(output_seg, masks)
 
@@ -108,11 +111,12 @@ def train(model, dataloader, optimizer,scheduler, device, epoch, batch_size, che
     return avg_loss
 
 
-def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None, thresh=None, verbose=True):
+def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None, thresh=None, verbose=True, center_crop=None):
     # Delegates to the shared metric so val and test are guaranteed identical:
     # foreground-only IoU/Dice, swept thresholds. The best-IoU threshold on THIS
     # validation set is returned as 'best_thresh' and later frozen for test.
-    res = evaluate_segmentation(model, dataloader, device, batch_size, criterion=criterion)
+    res = evaluate_segmentation(model, dataloader, device, batch_size, criterion=criterion,
+                                center_crop=center_crop)
 
     best_t   = pick_best_threshold(res)
     if res['fg_count'] == 0:
@@ -122,17 +126,21 @@ def val(model, dataloader, device, batch_size, criterion, checkpoint_path=None, 
         avg_iou  = res['fg_iou'][best_t]
         avg_dice = res['fg_dice'][best_t]
 
+    pooled_05 = res['pooled_iou'].get(0.0, float("nan"))
+
     if verbose:
         print(f"  FG logit mean={res['fg_logit_mean']:.3f}  BG logit mean={res['bg_logit_mean']:.3f}  "
               f"adaptive(midpoint)={res['adaptive_thresh']:.3f}")
         print(f"Validation [FG-only, n={res['fg_count']}]: "
               f"IoU={avg_iou:.4f}  Dice={avg_dice:.4f}  Loss={res['loss']:.4f}  "
-              f"best_thresh={best_t:+.1f}  empty-FP={res['empty_fp_rate'].get(best_t, float('nan')):.3f}")
+              f"best_thresh={best_t:+.1f}  empty-FP={res['empty_fp_rate'].get(best_t, float('nan')):.3f}  "
+              f"pooled-IoU@0.5={pooled_05:.4f}")
 
     return {
         'loss': res['loss'],
         'iou': avg_iou,            # FG-only IoU at the val-optimal threshold
         'dice': avg_dice,
+        'pooled_iou_05': pooled_05,  # Zheng et al. 2024 comparison metric
         'proportion': res['proportion'],
         'best_thresh': best_t,     # frozen and applied at test time (no leakage)
     }

@@ -45,6 +45,22 @@ def calculate_proportion(y_pred):
     return proportion
 
 
+def center_crop_pair(logits, masks, size):
+    """Crop both tensors to the central size×size window (last two dims).
+
+    Same arithmetic as Zheng et al. 2024's narrow() cropping: offset (H-size)//2.
+    No-op when size is None or the tensors are already no larger than size.
+    """
+    if size is None:
+        return logits, masks
+    H, W = logits.shape[-2], logits.shape[-1]
+    if H <= size and W <= size:
+        return logits, masks
+    top, left = (H - size) // 2, (W - size) // 2
+    return (logits[..., top:top + size, left:left + size],
+            masks[..., top:top + size, left:left + size])
+
+
 # Logit thresholds swept during evaluation. 0.0 == sigmoid(logit) > 0.5.
 # Spans the old imbalanced-BCE regime (boundary ~-2) and the corrected regime
 # (boundary ~0 once pos_weight compensates the imbalance), finer near 0.
@@ -53,12 +69,16 @@ EVAL_THRESHOLDS = [-6.0, -4.0, -3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]
 
 def evaluate_segmentation(model, dataloader, device, batch_size,
                           criterion=None, save_dir=None, max_vis_samples=0,
-                          thresholds=None):
+                          thresholds=None, center_crop=None):
     """Single source of truth for the IoU/Dice metric, shared by val() and app().
 
     - IoU/Dice are FOREGROUND-ONLY: images with an empty GT mask are excluded
       entirely (not scored 0 or 1). Their spurious firing is reported separately
       as empty_fp_rate.
+    - pooled_iou is the confusion-matrix IoU = TP/(TP+FP+FN) accumulated over
+      ALL pixels of ALL images (empty-GT included). This is the metric of
+      Zheng et al. 2024 (their test IoU=0.40); read it at threshold 0.0
+      (logit 0 == prob 0.5) for a like-for-like comparison.
     - The threshold sweep is vectorised on-device (accumulators stay on GPU,
       synced once at the end) so calling it every epoch in val() is cheap.
     Returns raw per-threshold curves; callers decide which threshold to report.
@@ -72,6 +92,9 @@ def evaluate_segmentation(model, dataloader, device, batch_size,
     fg_iou_sum  = torch.zeros(K, device=device)
     fg_dice_sum = torch.zeros(K, device=device)
     empty_fp    = torch.zeros(K, device=device)
+    pooled_inter = torch.zeros(K, device=device)
+    pooled_pred  = torch.zeros(K, device=device)
+    pooled_gt    = torch.zeros((), device=device)
     fg_logit_sum = torch.zeros((), device=device); fg_logit_n = torch.zeros((), device=device)
     bg_logit_sum = torch.zeros((), device=device); bg_logit_n = torch.zeros((), device=device)
     fg_count, empty_count = 0, 0
@@ -84,6 +107,11 @@ def evaluate_segmentation(model, dataloader, device, batch_size,
             if images.size(0) < batch_size:
                 continue
             logits = model(images)                       # [B,1,H,W]
+            # Zheng et al. 2024 protocol: score only the central region whose
+            # receptive field is fully inside the tile. Images cropped too so
+            # the visualisations stay aligned with what is scored.
+            logits, masks = center_crop_pair(logits, masks, center_crop)
+            images = center_crop_pair(images, images, center_crop)[0]
             if criterion is not None:
                 total_loss += criterion(logits, masks).item()
 
@@ -100,11 +128,14 @@ def evaluate_segmentation(model, dataloader, device, batch_size,
             for i in range(batch_size):
                 gt = masks[i]                            # [1,H,W]
                 pred = (logits[i].unsqueeze(0) > T).float()          # [K,1,H,W]
+                psum = pred.sum(dim=(1, 2, 3))                       # [K]
+                inter = (pred * gt).sum(dim=(1, 2, 3))               # [K]
+                pooled_inter += inter
+                pooled_pred  += psum
+                pooled_gt    += gt_sums[i]
                 if nonempty[i]:
                     fg_count += 1
                     gt_sum = gt_sums[i]
-                    inter = (pred * gt).sum(dim=(1, 2, 3))           # [K]
-                    psum  = pred.sum(dim=(1, 2, 3))                  # [K]
                     union = psum + gt_sum - inter
                     denom = psum + gt_sum
                     fg_iou_sum  += torch.where(union > 0, inter / union, torch.ones_like(inter))
@@ -142,6 +173,9 @@ def evaluate_segmentation(model, dataloader, device, batch_size,
                for k, t in enumerate(thresholds)}
     fp_rate = {t: (empty_fp[k] / empty_count).item() if empty_count else float("nan")
                for k, t in enumerate(thresholds)}
+    pooled_union = pooled_pred + pooled_gt - pooled_inter
+    pooled_iou = {t: (pooled_inter[k] / pooled_union[k]).item() if pooled_union[k] > 0 else float("nan")
+                  for k, t in enumerate(thresholds)}
     fg_lm = (fg_logit_sum / fg_logit_n).item() if fg_logit_n > 0 else float("nan")
     bg_lm = (bg_logit_sum / bg_logit_n).item() if bg_logit_n > 0 else float("nan")
 
@@ -149,6 +183,7 @@ def evaluate_segmentation(model, dataloader, device, batch_size,
         'thresholds':   list(thresholds),
         'fg_iou':       fg_iou,
         'fg_dice':      fg_dice,
+        'pooled_iou':   pooled_iou,
         'empty_fp_rate': fp_rate,
         'fg_count':     fg_count,
         'empty_count':  empty_count,
@@ -170,17 +205,20 @@ def pick_best_threshold(res):
     return max(thr, key=lambda t: (res['fg_iou'][t], t))
 
 
-def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20, thresh=None):
+def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20, thresh=None,
+        center_crop=None):
     """Test-time evaluation. `thresh` is the FROZEN threshold chosen on validation
     (no leakage). If None (e.g. legacy checkpoint), fall back to the best-on-test
     threshold, which is an optimistic diagnostic ceiling — logged as such."""
     res = evaluate_segmentation(model, dataloader, device, batch_size,
                                 criterion=nn.BCEWithLogitsLoss(),
-                                save_dir=save_dir, max_vis_samples=max_vis_samples)
+                                save_dir=save_dir, max_vis_samples=max_vis_samples,
+                                center_crop=center_crop)
 
     if res['fg_count'] == 0:
         print("[WARN] no foreground images in this test set — IoU undefined")
         return {'loss': res['loss'], 'iou': float("nan"), 'dice': float("nan"),
+                'pooled_iou_05': res['pooled_iou'].get(0.0, float("nan")),
                 'proportion': res['proportion'], 'best_thresh': float("nan"),
                 'iou_best_on_test': float("nan"), 'empty_fp_rate': float("nan")}
 
@@ -193,16 +231,23 @@ def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20, thr
         # Snap the frozen threshold to the nearest swept grid point.
         report_t = min(res['thresholds'], key=lambda t: abs(t - thresh))
 
+    # Zheng et al. 2024 comparison metric: pooled confusion-matrix IoU at
+    # prob 0.5 (logit 0.0). Their published test value is 0.40.
+    pooled_05 = res['pooled_iou'].get(0.0, float("nan"))
+
     print(f"Average Loss : {res['loss']}")
     print(f"[FG-only, n={res['fg_count']}] report@t={report_t:+.1f}: "
           f"IoU={res['fg_iou'][report_t]:.4f}  Dice={res['fg_dice'][report_t]:.4f}  "
           f"empty-FP={res['empty_fp_rate'][report_t]:.3f}   "
           f"(best-on-test t={best_on_test:+.1f}, IoU={res['fg_iou'][best_on_test]:.4f})")
+    print(f"[Zheng-comparable] pooled IoU@0.5 = {pooled_05:.4f}  "
+          f"(paper U-Net baseline: 0.40; pooled@report_t={res['pooled_iou'][report_t]:.4f})")
 
     return {
         'loss':             res['loss'],
         'iou':              res['fg_iou'][report_t],   # FG-only at the FROZEN val threshold
         'dice':             res['fg_dice'][report_t],
+        'pooled_iou_05':    pooled_05,                 # Zheng et al. 2024 metric
         'proportion':       res['proportion'],
         'best_thresh':      report_t,
         'iou_best_on_test': res['fg_iou'][best_on_test],

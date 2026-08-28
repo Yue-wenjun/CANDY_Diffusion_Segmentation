@@ -19,6 +19,8 @@ def build_criterion(loss_spec: str, device):
 
     Formats:
       dice              → DiceLoss(sigmoid=True)
+      softiou           → DiceLoss(sigmoid=True, jaccard=True), the soft IoU loss
+                          used by Zheng et al. 2024 (10.1029/2023GL107555) Text S2
       bce               → BCEWithLogitsLoss(pos_weight=10)
       bce:N             → BCEWithLogitsLoss(pos_weight=N)
       dice+bce:W        → DiceLoss + W * BCEWithLogitsLoss(pos_weight=10)
@@ -28,6 +30,9 @@ def build_criterion(loss_spec: str, device):
 
     if spec == "dice":
         return DiceLoss(sigmoid=True)
+
+    if spec == "softiou":
+        return DiceLoss(sigmoid=True, jaccard=True)
 
     if spec.startswith("bce"):
         parts = spec.split(":")
@@ -50,7 +55,7 @@ def build_criterion(loss_spec: str, device):
 
     raise ValueError(
         f"Unknown loss spec '{loss_spec}'. "
-        "Use: dice | bce | bce:N | dice+bce:W | dice+bce:W:N"
+        "Use: dice | softiou | bce | bce:N | dice+bce:W | dice+bce:W:N"
     )
 
 
@@ -69,6 +74,12 @@ class DiffusionCLI:
         if lr is not None:
             config["lr"] = lr
 
+        # 实验配置中固定的损失优先于 CLI 默认值（如 zheng_baseline 必须用 softiou）
+        if "loss_spec" in config:
+            if loss_spec != config["loss_spec"]:
+                print(f"[config] loss_spec '{loss_spec}' → '{config['loss_spec']}' (fixed by experiment config)")
+            loss_spec = config["loss_spec"]
+
         print(f"\n=== Running {model_type} model ===")
         if model_type == "adjust_steps":
             print(f"Current diffusion steps: {config['T']}")
@@ -82,7 +93,7 @@ class DiffusionCLI:
             train_loader, val_loader = get_kfold_dataloaders(
                 "cropped_images",
                 "cropped_masks",
-                BASE_CONFIG["batch_size"],
+                config["batch_size"],
                 n_splits=k_folds,
                 fold=current_fold,
             )
@@ -93,7 +104,7 @@ class DiffusionCLI:
             train_loader, val_loader, test_loader = get_dataloaders(
                 "cropped_images",
                 "cropped_masks",
-                BASE_CONFIG["batch_size"],
+                config["batch_size"],
                 0.05,
                 0.05,
             )
@@ -101,18 +112,42 @@ class DiffusionCLI:
         model_wrapper = DiffusionModelWrapper(config)
         model = model_wrapper.create_model(model_type).to(self.device)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=1e-4)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=config["lr"],
+            weight_decay=config.get("weight_decay", 1e-4),
+        )
         criterion = build_criterion(loss_spec, self.device)
-        print(f"Loss: {loss_spec}  LR: {config['lr']}")
+        print(f"Loss: {loss_spec}  LR: {config['lr']}  WD: {config.get('weight_decay', 1e-4)}  "
+              f"Scheduler: {config.get('scheduler', 'onecycle')}")
 
         steps_per_epoch = len(train_loader)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=config["lr"],
-            steps_per_epoch=steps_per_epoch,
-            epochs=num_epochs,
-            pct_start=0.1,
-        )
+        if config.get("scheduler", "onecycle") == "warmup_poly":
+            # Zheng et al. 2024 的调度 (U-net_1km/utils/step_lr_scheduler.py):
+            # 指数 warmup 1e-3 → lr（前 1000 iter），之后 poly 衰减 (幂 0.9)。
+            # scheduler 在 train() 里逐 batch step，与作者逐 iter 更新一致。
+            max_iter = steps_per_epoch * num_epochs
+            warmup_iters = 1000
+            if max_iter <= 2 * warmup_iters:
+                warmup_iters = max(1, max_iter // 10)
+                print(f"[warmup_poly] total iters={max_iter} too few for 1000-iter warmup, "
+                      f"capped to {warmup_iters}")
+            warmup_start_factor = 0.001 / config["lr"]
+            growth = (1.0 / warmup_start_factor) ** (1.0 / warmup_iters)
+
+            def _warmup_poly(it):
+                if it < warmup_iters:
+                    return warmup_start_factor * (growth ** it)
+                return (1.0 - (it - warmup_iters) / max(1, max_iter - warmup_iters)) ** 0.9
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _warmup_poly)
+        else:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=config["lr"],
+                steps_per_epoch=steps_per_epoch,
+                epochs=num_epochs,
+                pct_start=0.1,
+            )
 
         # Adjust checkpoint path for k-fold
         base_checkpoint_path = checkpoint_path_template
@@ -149,16 +184,18 @@ class DiffusionCLI:
                 scheduler,
                 self.device,
                 epoch,
-                BASE_CONFIG["batch_size"],
+                config["batch_size"],
                 checkpoint_path,
                 criterion,
+                center_crop=config.get("center_crop"),
             )
             val_metrics = val(
                 model,
                 val_loader,
                 self.device,
-                BASE_CONFIG["batch_size"],
+                config["batch_size"],
                 criterion,
+                center_crop=config.get("center_crop"),
             )
             val_loss = val_metrics["loss"]
             iou = val_metrics["iou"]
@@ -182,8 +219,9 @@ class DiffusionCLI:
                 model,
                 test_loader,
                 self.device,
-                BASE_CONFIG["batch_size"],
+                config["batch_size"],
                 save_dir,
+                center_crop=config.get("center_crop"),
             )
 
             print(f"\n=== Execution completed ===")
@@ -207,15 +245,18 @@ class DiffusionCLI:
 
         config, checkpoint_path_template, _ = get_config(model_type, custom_steps)
 
+        if "loss_spec" in config:
+            loss_spec = config["loss_spec"]
+
         if k_folds > 1:
             _, val_loader = get_kfold_dataloaders(
                 "cropped_images", "cropped_masks",
-                BASE_CONFIG["batch_size"], n_splits=k_folds, fold=current_fold,
+                config["batch_size"], n_splits=k_folds, fold=current_fold,
             )
         else:
             _, val_loader, _ = get_dataloaders(
                 "cropped_images", "cropped_masks",
-                BASE_CONFIG["batch_size"], 0.05, 0.05,
+                config["batch_size"], 0.05, 0.05,
             )
 
         model_wrapper = DiffusionModelWrapper(config)
@@ -234,8 +275,9 @@ class DiffusionCLI:
 
         # One evaluation pass produces the whole FG-only IoU/Dice curve.
         res = evaluate_segmentation(model, val_loader, self.device,
-                                    BASE_CONFIG["batch_size"], criterion=criterion,
-                                    thresholds=thresholds)
+                                    config["batch_size"], criterion=criterion,
+                                    thresholds=thresholds,
+                                    center_crop=config.get("center_crop"))
         print(f"\nThreshold sweep on {best_ckpt}  (FG-only, n={res['fg_count']})")
         print(f"{'Threshold':>12}  {'IoU':>8}  {'Dice':>8}  {'empty-FP':>9}")
         print("-" * 46)
@@ -373,6 +415,7 @@ if __name__ == "__main__":
         help=(
             "Loss function spec (default: bce). Options:\n"
             "  dice            → DiceLoss(sigmoid=True)\n"
+            "  softiou         → soft IoU loss (Zheng et al. 2024 baseline)\n"
             "  bce             → BCEWithLogitsLoss(pos_weight=10)\n"
             "  bce:N           → BCEWithLogitsLoss(pos_weight=N)\n"
             "  dice+bce:W      → DiceLoss + W*BCE(pos_weight=10)\n"

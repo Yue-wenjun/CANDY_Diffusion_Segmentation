@@ -17,6 +17,18 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import json
 
+def normalize_sar(img):
+    """Per-image SAR preprocessing, shared by ALL splits (train/val/test) so the
+    model never sees a different input distribution at test time.
+
+    SAR amplitudes are log-normal with a huge dynamic range; log1p compresses it,
+    then per-image z-score centres it. Per-image stats are self-contained — no
+    train-set statistics, hence no leakage and identical behaviour everywhere.
+    """
+    img = torch.log1p(img.clamp(min=0))          # log(1+x); clamp guards NaN-fill negatives
+    return (img - img.mean()) / (img.std() + 1e-8)
+
+
 class CustomDataset(Dataset):
     def __init__(self, image_dir, mask_dir, transform=None, indices=None):
         self.image_dir = image_dir
@@ -24,6 +36,18 @@ class CustomDataset(Dataset):
         self.transform = transform
         all_images = sorted(os.listdir(image_dir))
         all_masks = sorted(os.listdir(mask_dir))
+
+        # Pairing is positional (images[i] ↔ masks[i]); a count mismatch means the
+        # sorted lists cannot align — fail loud rather than train on mispaired data.
+        if len(all_images) != len(all_masks):
+            raise ValueError(
+                f"image/mask count mismatch: {len(all_images)} images vs "
+                f"{len(all_masks)} masks in '{image_dir}' / '{mask_dir}'"
+            )
+        if all_images:
+            # ASCII only: Windows GBK consoles cannot encode fancy arrows.
+            print(f"[pairing] {len(all_images)} pairs; "
+                  f"first={all_images[0]}<->{all_masks[0]}  last={all_images[-1]}<->{all_masks[-1]}")
 
         if indices is not None:
             self.images = [all_images[i] for i in indices]
@@ -69,7 +93,7 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx):
         # 现在的切片操作是底层的 C++ 内存指针偏移，耗时严格等于 0
-        image = self.all_images[idx]
+        image = normalize_sar(self.all_images[idx])   # SAME preprocessing as training
         mask = self.all_masks[idx]
 
         if self.transform:
@@ -169,13 +193,8 @@ class _AugSubset(torch.utils.data.Dataset):
         return len(self.indices)
 
     def __getitem__(self, i):
-        img  = self.base.all_images[self.indices[i]]
+        img  = normalize_sar(self.base.all_images[self.indices[i]])   # shared preprocessing
         mask = self.base.all_masks[self.indices[i]]
-
-        # Log-transform then z-score: SAR amplitudes are log-normally distributed;
-        # log makes ship/sea contrast more stable across scenes.
-        img = torch.log1p(img.clamp(min=0))   # log(1+x), clamp guards against negatives from NaN fill
-        img = (img - img.mean()) / (img.std() + 1e-8)
 
         if self.augment:
             # Random 90° rotation (k=0,1,2,3)

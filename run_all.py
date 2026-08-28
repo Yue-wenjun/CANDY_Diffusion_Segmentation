@@ -47,6 +47,9 @@ TRAIN_MODELS = [
     "pure_unet", "pure_segformer", "pure_mobilevit",
     # Structural ablations
     "no_skip", "simple_cnn", "simple_decoder", "sde", "adjust_steps", "ddpm",
+    # Literature baseline: Zheng et al. 2024 U-Net (loss/scheduler forced by config,
+    # the -l flag passed at train time is overridden with a printed note)
+    "zheng_baseline",
 ]
 
 # Noise robustness: only these models
@@ -62,8 +65,8 @@ OUTPUT_ROOT     = "noise_test_results"
 CSV_FILENAME    = "results.csv"
 # IoU/Dice are foreground-only (empty-GT excluded), at the val-frozen threshold.
 # IoU_BestOnTest is the leaky best-on-test ceiling, kept only as a diagnostic.
-CSV_FIELDS      = ["Model", "Fold", "Condition", "Loss", "IoU", "Dice", "Proportion",
-                   "Best_Thresh", "IoU_BestOnTest", "Empty_FP_Rate"]
+CSV_FIELDS      = ["Model", "Fold", "Condition", "Loss", "IoU", "Dice", "Pooled_IoU_05",
+                   "Proportion", "Best_Thresh", "IoU_BestOnTest", "Empty_FP_Rate"]
 BEST_FOLDS_PATH = "best_folds.json"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -79,9 +82,13 @@ def _log(msg):
 def run_cmd(cmd):
     _log(f"CMD: {' '.join(cmd)}")
     lines = []
+    # PYTHONUTF8=1 forces the child's stdout to UTF-8 regardless of the Windows
+    # console codepage (GBK), so a stray non-GBK character in any print() can
+    # never crash a training run again.
     proc  = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
+        env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
     )
     with open("log.txt", "a", encoding="utf-8") as log_f:
         for line in proc.stdout:
@@ -184,11 +191,18 @@ def phase_train():
             output = run_cmd(["python", "main.py", model, "-e", str(EPOCHS),
                               "-k", str(K_FOLDS), "-l", LOSS_SPEC])
             bf = parse_best_fold(output)
+            # main.py swallows per-fold exceptions and exits 0, so a fully
+            # failed run still reaches here. Only a produced checkpoint proves
+            # training happened — never mark a model trained without one.
+            if not os.path.exists(_ckpt_path(model, bf)):
+                _log(f"ERROR: {model}: no checkpoint at {_ckpt_path(model, bf)} — "
+                     f"training failed, NOT marked as trained. Fix the error and rerun.")
+                continue
             best_folds[model] = bf
             _log(f">>> {model}: best fold = {bf}")
         except Exception as e:
-            _log(f"ERROR training {model}: {e}")
-            best_folds[model] = 1
+            _log(f"ERROR training {model}: {e} — NOT marked as trained.")
+            continue
 
         with open(BEST_FOLDS_PATH, "w") as f:
             json.dump(best_folds, f, indent=2)
@@ -257,7 +271,7 @@ def phase_test():
                 save_dir = os.path.join(OUTPUT_ROOT, model_type, f"fold{fold}_{condition_name}")
                 os.makedirs(save_dir, exist_ok=True)
                 metrics = app(model, test_loader, device, BASE_CONFIG["batch_size"], save_dir,
-                              thresh=frozen_t)
+                              thresh=frozen_t, center_crop=config.get("center_crop"))
 
                 del model
                 torch.cuda.empty_cache()
@@ -270,6 +284,7 @@ def phase_test():
                         "Loss":          metrics["loss"],
                         "IoU":           metrics["iou"],
                         "Dice":          metrics["dice"],
+                        "Pooled_IoU_05": metrics.get("pooled_iou_05"),
                         "Proportion":    metrics["proportion"],
                         "Best_Thresh":    metrics["best_thresh"],
                         "IoU_BestOnTest": metrics["iou_best_on_test"],

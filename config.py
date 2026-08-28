@@ -9,6 +9,13 @@ BASE_CONFIG = {
     "epochs": 11,
     "k_folds": 4,
     "lr": 0.0005,
+    "weight_decay": 1e-4,
+    # --- LR 调度: "onecycle" | "warmup_poly" (Zheng et al. 2024: 指数 warmup + poly 衰减) ---
+    "scheduler": "onecycle",
+    # --- 损失/指标只计算输出的中心 center_crop×center_crop 区域 (None=整图) ---
+    # 与切片协议配套: 252 切片、步长 68、偏移 -92 → 各切片中心 68×68 无缝铺满整幅图,
+    # 92 像素边缘余量只作上下文。与 Zheng et al. 2024 (cut_w=cut_h=68) 一致。
+    "center_crop": 68,
     # --- 模型结构参数 ---
     "in_channel": 1,
     "hidden_channel": 1,
@@ -95,6 +102,21 @@ ABLATION_REGISTRY = {
         "checkpoint": "checkpoint/adjust_steps.pth",
         "save_dir": "./imgs/adjust_steps",
         "override_config": {"T": 5},
+    },
+    # 【文献基线】Zheng et al. 2024 (GRL 10.1029/2023GL107555) 的 U-Net，
+    # 训练配方按作者代码 (U-net_1km/train_binary.py + 训练日志) 严格复现:
+    # SoftIOU 损失 / Adam lr=0.01 wd=0 / 指数 warmup(1000 iter)+poly 衰减 / batch=32
+    # 论文测试集 pooled IoU = 0.40 是对比目标
+    "zheng_baseline": {
+        "checkpoint": "checkpoint/zheng_baseline.pth",
+        "save_dir": "./imgs/zheng_baseline",
+        "override_config": {
+            "lr": 0.01,
+            "weight_decay": 0.0,
+            "batch_size": 32,
+            "scheduler": "warmup_poly",
+            "loss_spec": "softiou",
+        },
     },
     # DDPM 基线：用高斯噪声前向过程替换 CANDY，其余结构相同，验证 CANDY 前向的优越性
     "ddpm": {
