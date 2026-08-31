@@ -24,12 +24,16 @@ _archive_*/
 log.txt
 results.csv
 多折多噪声测试指标汇总.csv
-.pdf
+*.pdf
 
 # ── Datasets ──────────────────────────────────────────────────────────────────
 raw_data/
 cropped_images/
 cropped_masks/
+# Sen1Floods11 flood chips downloaded by sen1floods11.py --download (~800MB)
+sen1floods11/
+# quarantined orphan tiles from check_pairs.py
+_orphan_masks/
 cropped_noised_data/
 # noise.py writes noised_data_{snr}dB/ to the repo root
 noised_data_*dB/

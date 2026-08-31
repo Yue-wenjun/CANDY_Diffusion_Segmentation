@@ -1,0 +1,24 @@
+# CANDY Diffusion Segmentation — Python dependencies (excluding PyTorch).
+#
+# IMPORTANT: install torch/torchvision SEPARATELY from the CUDA 12.8 index
+# BEFORE this file, because an RTX 5090 (Blackwell, sm_120) only has kernels
+# in the cu128 wheels:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# Then: pip install -r requirements.txt
+#
+# (torch/torchvision are intentionally NOT listed here so a plain
+#  `pip install -r requirements.txt` can't pull the wrong CPU/cu124 build.)
+
+numpy
+pandas
+matplotlib
+scikit-image
+scikit-learn
+tqdm
+Pillow
+h5py
+rasterio            # Windows: modern wheels bundle GDAL; no conda needed
+monai               # DiceLoss / soft-IoU loss
+timm                # backbone blocks for segformer/mobilevit variants
+transformers        # SegFormer / MobileViT decoders
+tifffile            # used by the flood data probe / quick inspection
