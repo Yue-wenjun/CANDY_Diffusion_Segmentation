@@ -23,6 +23,17 @@ python -m pip install --upgrade pip
 
 ## 2. PyTorch — cu128, BEFORE anything else
 
+**The #1 trap: a plain `pip install torch` on Windows installs the CPU-only
+wheel.** It imports fine and trains — just silently on the CPU, ~10-50x slower,
+no error. Three rules to never hit it:
+
+1. **Always** use `--index-url` (note: `--index-url`, NOT `--extra-index-url` —
+   the former searches ONLY the cu128 index so a CPU wheel is impossible; the
+   latter can still resolve to the CPU wheel from PyPI).
+2. Install torch **first**, before any package that depends on it, so pip can't
+   pull a CPU torch in as a side-dependency.
+3. Never put `torch` in requirements.txt (it is deliberately absent).
+
 ```powershell
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
@@ -36,22 +47,37 @@ pip install -r requirements.txt
 
 ## 4. Verify the GPU is actually usable (do NOT skip)
 
+A committed hard-check that fails loudly on a CPU build, a too-old driver, or the
+Blackwell kernel gap:
+
 ```powershell
-python -c "import torch; print('torch', torch.__version__); print('cuda?', torch.cuda.is_available()); print(torch.cuda.get_device_name(0)); x=torch.randn(4096,4096,device='cuda'); print('matmul ok', (x@x).sum().item())"
+python verify_gpu.py
 ```
 
-Expected: a torch version like `2.7.x+cu128`, `cuda? True`, `NVIDIA GeForce RTX
-5090`, and a finite `matmul ok` number. If `cuda? False` → driver too old. If it
-prints True but the matmul throws `no kernel image` → a non-cu128 torch slipped
-in; run `pip uninstall torch torchvision -y` and redo step 2.
+Must end with `PASS: GPU compute works ...` and show `torch.version.cuda = 12.8`,
+`cuda.is_available() = True`, `NVIDIA GeForce RTX 5090 (sm_120)`. Any `FAIL:`
+line prints the exact fix. The tell-tale of a CPU build is
+`torch.version.cuda = None` (or a `+cpu` version string).
+
+**Re-run `python verify_gpu.py` after step 3 as well** — installing other
+packages can silently downgrade or replace torch with a CPU build. If it ever
+regresses:
+
+```powershell
+pip uninstall torch torchvision -y
+pip cache purge          # so pip does not reinstall the cached CPU wheel
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+```
 
 ## 5. Smoke-test the two pipelines
 
 ```powershell
-# Flood data (small, ~800MB) + a 1-epoch sanity run on the U-Net baseline
+# Flood data (small, ~800MB) + a 1-epoch sanity run on the U-Net baseline.
+# verify_gpu.py gates the run so training can never start on a CPU torch.
+python verify_gpu.py
 python sen1floods11.py --download
 python sen1floods11.py --check
-python train_flood.py zheng_baseline -e 1 -b 8
+python verify_gpu.py; if ($?) { python train_flood.py zheng_baseline -e 1 -b 8 }
 
 # Rainband pipeline (needs cropped_images/ cropped_masks/ present)
 python check_pairs.py
