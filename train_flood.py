@@ -58,7 +58,8 @@ class MaskedBCE(nn.Module):
     """BCE-with-logits over valid pixels only (label != IGNORE_INDEX).
 
     pos_weight compensates the heavy water/non-water imbalance (water is often
-    <5% of valid pixels)."""
+    <5% of valid pixels). NOTE: fragile — an unbounded loss whose value explodes
+    on extreme eval-mode logits (BatchNorm at small batch). Prefer MaskedDice."""
     def __init__(self, pos_weight, device):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(
@@ -70,6 +71,27 @@ class MaskedBCE(nn.Module):
         loss = self.bce(logits, target) * valid
         denom = valid.sum().clamp(min=1.0)
         return loss.sum() / denom
+
+
+class MaskedDice(nn.Module):
+    """Soft Dice over valid pixels, ignoring label == IGNORE_INDEX.
+
+    Bounded in [0,1] (so it cannot blow up the way weighted BCE does), scale-free,
+    and inherently robust to the water/non-water imbalance — no pos_weight to tune.
+    This is the default flood loss; BCE is kept only as an ablation."""
+    def __init__(self, eps=1.0):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, logits, mask):
+        valid = (mask != IGNORE_INDEX).float()
+        target = mask.clamp(min=0.0) * valid
+        prob = torch.sigmoid(logits) * valid            # ignored pixels contribute 0 to both
+        dims = (1, 2, 3)                                 # per-image Dice, then batch mean
+        inter = (prob * target).sum(dims)
+        denom = prob.sum(dims) + target.sum(dims)
+        dice = (2.0 * inter + self.eps) / (denom + self.eps)
+        return (1.0 - dice).mean()
 
 
 # ── Ignore-aware metrics ──────────────────────────────────────────────────────
@@ -124,9 +146,11 @@ def main():
     ap.add_argument("model_type", help="baseline | zheng_baseline | segformer | mobilevit | pure_unet | ...")
     ap.add_argument("-e", "--epochs", type=int, default=100)
     ap.add_argument("-b", "--batch_size", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--loss", choices=["dice", "bce"], default="dice",
+                    help="dice (default, bounded & imbalance-robust) | bce (needs --pos_weight)")
     ap.add_argument("--pos_weight", type=float, default=15.0,
-                    help="BCE positive-class weight; ~ (non-water/water) valid-pixel ratio")
+                    help="BCE positive-class weight (only used with --loss bce)")
     ap.add_argument("--root", default="sen1floods11")
     ap.add_argument("--ckpt", default=None)
     args = ap.parse_args()
@@ -143,7 +167,8 @@ def main():
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=args.lr, steps_per_epoch=len(train_loader),
         epochs=args.epochs, pct_start=0.1)
-    criterion = MaskedBCE(args.pos_weight, device)
+    criterion = MaskedDice() if args.loss == "dice" else MaskedBCE(args.pos_weight, device)
+    print(f"Loss: {args.loss}  LR: {args.lr}  batch: {args.batch_size}")
 
     ckpt = args.ckpt or f"checkpoint/flood_{args.model_type}_best.pth"
     os.makedirs(os.path.dirname(ckpt), exist_ok=True)
