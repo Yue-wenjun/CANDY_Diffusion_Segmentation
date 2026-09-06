@@ -76,8 +76,16 @@ class CustomDataset(Dataset):
             with rasterio.open(mask_path) as src:
                 mask = src.read()
 
-            mask = np.where(mask == 1, 1, mask)
-            mask = np.where(mask != 1, 0, mask)
+            # Label encoding: rainband(1) → 1 foreground, land(4) → -1 IGNORE,
+            # everything else (sea) → 0 background. Land is a distinct annotated
+            # class (value 4) that must be excluded from both loss and metrics —
+            # rainbands only exist on the sea surface, and land dark/rough patches
+            # would otherwise be scored as false positives (matches Zheng et al.'s
+            # no-land evaluation). -1 is the ignore sentinel, consistent with the
+            # flood pipeline. Downstream loss/metrics skip pixels where mask < 0.
+            land = np.isclose(mask, 4.0)
+            mask = np.where(mask == 1, 1.0, 0.0).astype(np.float32)
+            mask[land] = -1.0
 
             img_tensor = torch.nan_to_num(torch.from_numpy(image), nan=0.0).float()
             mask_tensor = torch.nan_to_num(torch.from_numpy(mask), nan=0.0).float()

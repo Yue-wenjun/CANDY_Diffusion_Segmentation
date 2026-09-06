@@ -45,6 +45,15 @@ def calculate_proportion(y_pred):
     return proportion
 
 
+def masked_bce_diag(logits, masks):
+    """Ignore-aware BCE for the test-loss diagnostic: land (mask == -1) excluded.
+    A plain BCEWithLogitsLoss would receive nonsensical -1 targets on land."""
+    valid = (masks > -0.5).float()
+    tgt = masks.clamp(min=0.0)
+    loss = F.binary_cross_entropy_with_logits(logits, tgt, reduction="none")
+    return (loss * valid).sum() / valid.sum().clamp(min=1.0)
+
+
 def center_crop_pair(logits, masks, size):
     """Crop both tensors to the central size×size window (last two dims).
 
@@ -115,19 +124,23 @@ def evaluate_segmentation(model, dataloader, device, batch_size,
             if criterion is not None:
                 total_loss += criterion(logits, masks).item()
 
-            # Class-conditional logit means (for the adaptive-threshold diagnostic).
-            fgm = masks > 0.5
-            bgm = ~fgm
+            # Land (mask == -1) is the ignore region: excluded from EVERY statistic
+            # below. valid = sea|rainband; rainband is the positive class.
+            valid = masks > -0.5
+            fgm = masks > 0.5                     # rainband (foreground)
+            bgm = valid & ~fgm                    # sea only — land is NOT background
             fg_logit_sum += logits[fgm].sum(); fg_logit_n += fgm.sum()
             bg_logit_sum += logits[bgm].sum(); bg_logit_n += bgm.sum()
 
-            # Per-image gt sums, moved to CPU once per batch to branch cheaply.
-            gt_sums = masks.sum(dim=(1, 2, 3))
+            # Per-image rainband pixel counts, moved to CPU once per batch.
+            gt_full = (masks > 0.5).float()                          # [B,1,H,W]
+            gt_sums = gt_full.sum(dim=(1, 2, 3))
             nonempty = (gt_sums > 0).tolist()
 
             for i in range(batch_size):
-                gt = masks[i]                            # [1,H,W]
-                pred = (logits[i].unsqueeze(0) > T).float()          # [K,1,H,W]
+                gt = gt_full[i]                          # [1,H,W] rainband target
+                vi = valid[i].float()                    # [1,H,W] 1=scored, 0=land
+                pred = (logits[i].unsqueeze(0) > T).float() * vi     # [K,1,H,W], land zeroed
                 psum = pred.sum(dim=(1, 2, 3))                       # [K]
                 inter = (pred * gt).sum(dim=(1, 2, 3))               # [K]
                 pooled_inter += inter
@@ -211,7 +224,7 @@ def app(model, dataloader, device, batch_size, save_dir, max_vis_samples=20, thr
     (no leakage). If None (e.g. legacy checkpoint), fall back to the best-on-test
     threshold, which is an optimistic diagnostic ceiling — logged as such."""
     res = evaluate_segmentation(model, dataloader, device, batch_size,
-                                criterion=nn.BCEWithLogitsLoss(),
+                                criterion=masked_bce_diag,
                                 save_dir=save_dir, max_vis_samples=max_vis_samples,
                                 center_crop=center_crop)
 

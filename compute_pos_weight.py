@@ -27,11 +27,12 @@ except ImportError:
 
 
 def binarize(mask):
-    # Identical to data_loading.CustomDataset: foreground is strictly value == 1,
-    # everything else (incl. NaN) becomes 0.
-    mask = np.where(mask == 1, 1, mask)
-    mask = np.where(mask != 1, 0, mask)
-    return np.nan_to_num(mask, nan=0.0).astype(np.float64)
+    # Identical to data_loading.CustomDataset: rainband(1) → 1 foreground,
+    # land(4) → -1 IGNORE, everything else (incl. NaN) → 0 background.
+    land = np.isclose(mask, 4.0)
+    m = np.where(mask == 1, 1.0, 0.0)
+    m[land] = -1.0
+    return np.nan_to_num(m, nan=0.0).astype(np.float64)
 
 
 def main():
@@ -43,8 +44,9 @@ def main():
     if not files:
         sys.exit(f"no files in {mask_dir}")
 
-    fg_pixels = 0          # count of value-1 pixels
-    total_pixels = 0
+    fg_pixels = 0          # count of value-1 (rainband) pixels
+    total_pixels = 0       # VALID pixels only (sea + rainband); land excluded
+    land_pixels = 0        # count of ignored land pixels
     empty_masks = 0        # images with zero foreground
     n = 0
     raw_values = set()     # sanity: what values actually appear (pre-binarize)
@@ -64,9 +66,11 @@ def main():
             raw_values.update(np.unique(raw).tolist()[:20])
 
         m = binarize(raw)
-        fg = int(m.sum())
+        fg = int((m == 1).sum())
+        land = int((m < 0).sum())
         fg_pixels += fg
-        total_pixels += m.size
+        land_pixels += land
+        total_pixels += m.size - land        # valid = sea + rainband (land excluded)
         if fg == 0:
             empty_masks += 1
         n += 1
@@ -92,8 +96,9 @@ def main():
     print(f"masks scanned            : {n}")
     print(f"raw values seen (sample) : {sorted(raw_values)}   (foreground assumed == 1)")
     print(f"foreground pixels        : {fg_pixels:,}")
-    print(f"background pixels        : {bg_pixels:,}")
-    print(f"foreground fraction      : {fg_fraction:.5f}  ({fg_fraction * 100:.3f}%)")
+    print(f"background pixels (sea)   : {bg_pixels:,}")
+    print(f"land pixels (ignored)    : {land_pixels:,}")
+    print(f"foreground fraction      : {fg_fraction:.5f}  ({fg_fraction * 100:.3f}%)  (of valid pixels)")
     print(f"empty masks (no fg)      : {empty_masks} / {n}  ({empty_masks / n:.4f})")
     print("-" * 60)
     print(f">>> pos_weight (bg/fg)   : {pos_weight:.2f}")

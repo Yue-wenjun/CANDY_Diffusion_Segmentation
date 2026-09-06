@@ -13,45 +13,65 @@ from utils import app, evaluate_segmentation
 from config import BASE_CONFIG, get_config, ABLATION_REGISTRY
 
 
+# Label < IGNORE_THRESH is the land ignore region (encoded -1 in data_loading).
+# All losses below mask those pixels out so land contributes nothing.
+IGNORE_THRESH = -0.5
+
+
+def _masked_bce(logits, target, pos_weight):
+    valid = (target > IGNORE_THRESH).float()
+    tgt = target.clamp(min=0.0)
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, tgt, pos_weight=pos_weight, reduction="none")
+    return (loss * valid).sum() / valid.sum().clamp(min=1.0)
+
+
+def _masked_dice(logits, target, jaccard=False, eps=1.0):
+    valid = (target > IGNORE_THRESH).float()
+    tgt = target.clamp(min=0.0) * valid
+    prob = torch.sigmoid(logits) * valid       # ignored pixels contribute 0 to both terms
+    dims = tuple(range(1, logits.dim()))
+    inter = (prob * tgt).sum(dims)
+    if jaccard:
+        score = (inter + eps) / (prob.sum(dims) + tgt.sum(dims) - inter + eps)
+    else:
+        score = (2.0 * inter + eps) / (prob.sum(dims) + tgt.sum(dims) + eps)
+    return (1.0 - score).mean()
+
+
 def build_criterion(loss_spec: str, device):
     """
-    Parse a loss spec string into a callable criterion.
+    Parse a loss spec string into a callable criterion. ALL variants ignore the
+    land region (target == -1): those pixels contribute nothing to the loss.
 
     Formats:
-      dice              → DiceLoss(sigmoid=True)
-      softiou           → DiceLoss(sigmoid=True, jaccard=True), the soft IoU loss
-                          used by Zheng et al. 2024 (10.1029/2023GL107555) Text S2
-      bce               → BCEWithLogitsLoss(pos_weight=10)
-      bce:N             → BCEWithLogitsLoss(pos_weight=N)
-      dice+bce:W        → DiceLoss + W * BCEWithLogitsLoss(pos_weight=10)
-      dice+bce:W:N      → DiceLoss + W * BCEWithLogitsLoss(pos_weight=N)
+      dice              → masked soft Dice
+      softiou           → masked soft IoU (Jaccard), the loss of Zheng et al. 2024
+      bce               → masked BCEWithLogits(pos_weight=10)
+      bce:N             → masked BCEWithLogits(pos_weight=N)
+      dice+bce:W        → masked Dice*W + masked BCE(pos_weight=10)
+      dice+bce:W:N      → masked Dice*W + masked BCE(pos_weight=N)
     """
     spec = loss_spec.strip().lower()
 
     if spec == "dice":
-        return DiceLoss(sigmoid=True)
+        return lambda pred, tgt: _masked_dice(pred, tgt)
 
     if spec == "softiou":
-        return DiceLoss(sigmoid=True, jaccard=True)
+        return lambda pred, tgt: _masked_dice(pred, tgt, jaccard=True)
 
     if spec.startswith("bce"):
         parts = spec.split(":")
-        pw = float(parts[1]) if len(parts) > 1 else 10.0
-        return torch.nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pw], device=device)
-        )
+        pw = torch.tensor([float(parts[1]) if len(parts) > 1 else 10.0], device=device)
+        return lambda pred, tgt: _masked_bce(pred, tgt, pw)
 
     if spec.startswith("dice+bce"):
         parts = spec.split(":")
         bce_w = float(parts[1]) if len(parts) > 1 else 0.2
-        pw    = float(parts[2]) if len(parts) > 2 else 10.0
-        _dice = DiceLoss(sigmoid=True)
-        _bce  = torch.nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([pw], device=device)
-        )
+        pw    = torch.tensor([float(parts[2]) if len(parts) > 2 else 10.0], device=device)
         # BCE drives optimization (anchors logit scale), Dice is a shape regularizer.
         # bce_w is the Dice weight; BCE weight is always 1 to keep loss on BCE scale.
-        return lambda pred, tgt: bce_w * _dice(pred, tgt) + _bce(pred, tgt)
+        return lambda pred, tgt: bce_w * _masked_dice(pred, tgt) + _masked_bce(pred, tgt, pw)
 
     raise ValueError(
         f"Unknown loss spec '{loss_spec}'. "
