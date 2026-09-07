@@ -111,7 +111,13 @@ ABLATION_REGISTRY = {
         "checkpoint": "checkpoint/zheng_baseline.pth",
         "save_dir": "./imgs/zheng_baseline",
         "override_config": {
-            "lr": 0.01,
+            # Loss stays soft IoU (the paper's defining choice, Text S2). The paper
+            # does NOT specify a learning rate — the author code's 0.01 caused a
+            # soft-IoU cold-start collapse here (val stuck ~0.005: sparse rainband
+            # → intersection≈0 → vanishing gradient at high LR). 1e-3 escapes it
+            # while keeping the method paper-faithful. If it still collapses, add a
+            # short BCE warm-up (loss_spec "dice+bce:...") for the first epochs.
+            "lr": 1e-3,
             "weight_decay": 0.0,
             "batch_size": 32,
             "scheduler": "warmup_poly",

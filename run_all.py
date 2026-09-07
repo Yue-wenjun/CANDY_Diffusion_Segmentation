@@ -52,8 +52,12 @@ TRAIN_MODELS = [
     "zheng_baseline",
 ]
 
-# Noise robustness: only these models
-NOISE_TEST_MODELS = ["baseline", "adjust_steps", "segformer", "mobilevit", "ddpm"]
+# Noise robustness. Includes the plain-U-Net family (pure_unet, zheng_baseline)
+# so CANDY's "diffusion forward chain is noise-robust" claim is tested against a
+# like-for-like baseline under identical noise — previously pure_unet was absent,
+# so the one place CANDY might win couldn't be measured.
+NOISE_TEST_MODELS = ["baseline", "baseline_tanh", "pure_unet", "zheng_baseline",
+                     "adjust_steps", "segformer", "mobilevit", "ddpm"]
 
 NOISE_LEVELS     = [0, 10, 20]
 CLEAN_IMAGE_PATH = "cropped_images"
