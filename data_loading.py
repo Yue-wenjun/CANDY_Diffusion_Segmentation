@@ -17,16 +17,28 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import json
 
-def normalize_sar(img):
+def normalize_sar(img, valid=None):
     """Per-image SAR preprocessing, shared by ALL splits (train/val/test) so the
     model never sees a different input distribution at test time.
 
     SAR amplitudes are log-normal with a huge dynamic range; log1p compresses it,
     then per-image z-score centres it. Per-image stats are self-contained — no
     train-set statistics, hence no leakage and identical behaviour everywhere.
+
+    `valid` (bool tensor, same shape) marks real-data pixels. No-data / no-image
+    regions (image NaN) must be excluded from the mean/std — otherwise the large
+    zero-filled no-data area (30-100% of some tiles) drags the statistics and
+    mis-normalizes the actual sea/rainband signal. No-data pixels are set to 0
+    after normalization.
     """
-    img = torch.log1p(img.clamp(min=0))          # log(1+x); clamp guards NaN-fill negatives
-    return (img - img.mean()) / (img.std() + 1e-8)
+    img = torch.log1p(img.clamp(min=0))          # log(1+x); values are already >= 0
+    if valid is None:
+        return (img - img.mean()) / (img.std() + 1e-8)
+    v = img[valid]
+    if v.numel() == 0:
+        return torch.zeros_like(img)             # fully no-data tile → all zeros
+    out = (img - v.mean()) / (v.std() + 1e-8)
+    return out * valid                           # no-data → 0
 
 
 class CustomDataset(Dataset):
@@ -76,23 +88,26 @@ class CustomDataset(Dataset):
             with rasterio.open(mask_path) as src:
                 mask = src.read()
 
-            # Label encoding: rainband(1) → 1 foreground, land(4) → -1 IGNORE,
-            # everything else (sea) → 0 background. Land is a distinct annotated
-            # class (value 4) that must be excluded from both loss and metrics —
-            # rainbands only exist on the sea surface, and land dark/rough patches
-            # would otherwise be scored as false positives (matches Zheng et al.'s
-            # no-land evaluation). -1 is the ignore sentinel, consistent with the
-            # flood pipeline. Downstream loss/metrics skip pixels where mask < 0.
+            # Two distinct ignore regions, both encoded as -1 in the mask:
+            #   land       — mask value 4 (a distinct annotated class; rainbands
+            #                exist only on the sea, and land patches would score as
+            #                false positives — matches Zheng et al.'s no-land eval)
+            #   no-data    — image is NaN (tile extends beyond the SAR footprint;
+            #                "no image"). Was zero-filled and scored as sea, and
+            #                polluted the per-image normalization. Now ignored.
+            # Label: rainband(1) → 1, land/no-data → -1 IGNORE, else (sea) → 0.
+            nodata = ~np.isfinite(image)                     # [1,H,W] bool, "no image"
             land = np.isclose(mask, 4.0)
             mask = np.where(mask == 1, 1.0, 0.0).astype(np.float32)
             mask[land] = -1.0
+            mask[nodata] = -1.0
 
-            img_tensor = torch.nan_to_num(torch.from_numpy(image), nan=0.0).float()
-            mask_tensor = torch.nan_to_num(torch.from_numpy(mask), nan=0.0).float()
-
-            # 直接填入预先分配好的巨型内存块中
-            self.all_images[i] = img_tensor
-            self.all_masks[i] = mask_tensor
+            img_raw = torch.nan_to_num(torch.from_numpy(image), nan=0.0).float()
+            valid = torch.from_numpy(~nodata)
+            # Normalize ONCE at load over real-data pixels; store the result so
+            # __getitem__ is a pure memory read (no per-access recompute).
+            self.all_images[i] = normalize_sar(img_raw, valid=valid)
+            self.all_masks[i] = torch.from_numpy(mask).float()
 
         print("巨型 Tensor 构建完毕！现在内存读取速度达到了理论极限。")
 
@@ -100,8 +115,9 @@ class CustomDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # 现在的切片操作是底层的 C++ 内存指针偏移，耗时严格等于 0
-        image = normalize_sar(self.all_images[idx])   # SAME preprocessing as training
+        # Images are already normalized at load (valid-pixel stats), so this is a
+        # pure memory read.
+        image = self.all_images[idx]
         mask = self.all_masks[idx]
 
         if self.transform:
@@ -201,7 +217,7 @@ class _AugSubset(torch.utils.data.Dataset):
         return len(self.indices)
 
     def __getitem__(self, i):
-        img  = normalize_sar(self.base.all_images[self.indices[i]])   # shared preprocessing
+        img  = self.base.all_images[self.indices[i]]   # already normalized at load
         mask = self.base.all_masks[self.indices[i]]
 
         if self.augment:
