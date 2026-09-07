@@ -37,16 +37,27 @@ def binarize(mask):
 
 def main():
     mask_dir = sys.argv[1] if len(sys.argv) > 1 else "cropped_masks"
+    image_dir = sys.argv[2] if len(sys.argv) > 2 else "cropped_images"
     if not os.path.isdir(mask_dir):
         sys.exit(f"mask dir not found: {mask_dir}")
+    has_images = os.path.isdir(image_dir)
+    if not has_images:
+        print(f"[warn] image dir '{image_dir}' not found — CANNOT exclude no-data "
+              f"(image NaN) pixels; pos_weight will be OVERestimated. Pass it as "
+              f"the 2nd arg for the correct value.")
 
     files = sorted(os.listdir(mask_dir))
+    img_files = sorted(os.listdir(image_dir)) if has_images else []
+    if has_images and len(img_files) != len(files):
+        print(f"[warn] {len(img_files)} images vs {len(files)} masks — pairing by "
+              f"sorted order may misalign; run check_pairs.py.")
     if not files:
         sys.exit(f"no files in {mask_dir}")
 
-    fg_pixels = 0          # count of value-1 (rainband) pixels
-    total_pixels = 0       # VALID pixels only (sea + rainband); land excluded
+    fg_pixels = 0          # count of value-1 (rainband) pixels, no-data excluded
+    total_pixels = 0       # VALID pixels only (sea + rainband); land AND no-data excluded
     land_pixels = 0        # count of ignored land pixels
+    nodata_pixels = 0      # count of ignored no-data (image NaN) pixels
     empty_masks = 0        # images with zero foreground
     n = 0
     raw_values = set()     # sanity: what values actually appear (pre-binarize)
@@ -66,11 +77,24 @@ def main():
             raw_values.update(np.unique(raw).tolist()[:20])
 
         m = binarize(raw)
-        fg = int((m == 1).sum())
+        # No-data (image NaN) is excluded exactly as data_loading does at train time.
+        nodata = np.zeros_like(m, dtype=bool)
+        if has_images and i < len(img_files):
+            try:
+                with rasterio.open(os.path.join(image_dir, img_files[i])) as src:
+                    img = src.read()
+                if img.shape == m.shape:
+                    nodata = ~np.isfinite(img)
+            except Exception as e:
+                print(f"  [skip img] {img_files[i]}: {e}")
+        valid = (m >= 0) & (~nodata)          # sea+rainband, minus land, minus no-data
+        fg = int(((m == 1) & valid).sum())
         land = int((m < 0).sum())
+        nd = int(nodata.sum())
         fg_pixels += fg
         land_pixels += land
-        total_pixels += m.size - land        # valid = sea + rainband (land excluded)
+        nodata_pixels += nd
+        total_pixels += int(valid.sum())     # valid = sea + rainband (land AND no-data excluded)
         if fg == 0:
             empty_masks += 1
         n += 1
@@ -98,6 +122,8 @@ def main():
     print(f"foreground pixels        : {fg_pixels:,}")
     print(f"background pixels (sea)   : {bg_pixels:,}")
     print(f"land pixels (ignored)    : {land_pixels:,}")
+    print(f"no-data pixels (ignored) : {nodata_pixels:,}"
+          + ("" if has_images else "   [NOT counted — pass image_dir!]"))
     print(f"foreground fraction      : {fg_fraction:.5f}  ({fg_fraction * 100:.3f}%)  (of valid pixels)")
     print(f"empty masks (no fg)      : {empty_masks} / {n}  ({empty_masks / n:.4f})")
     print("-" * 60)
