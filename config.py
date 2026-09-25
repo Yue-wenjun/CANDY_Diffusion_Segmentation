@@ -122,6 +122,11 @@ ABLATION_REGISTRY = {
             "batch_size": 32,
             "scheduler": "warmup_poly",
             "loss_spec": "softiou",
+            # Escape the soft-IoU cold-start: 5 epochs of BCE (calibrated
+            # pos_weight 16.0) first, then the paper's soft IoU for the rest.
+            # Method stays paper-faithful — soft IoU is the loss for 65/70 epochs.
+            "warmup_loss_spec": "bce:16.0",
+            "warmup_epochs": 5,
         },
     },
     # DDPM 基线：用高斯噪声前向过程替换 CANDY，其余结构相同，验证 CANDY 前向的优越性

@@ -137,8 +137,16 @@ class DiffusionCLI:
             weight_decay=config.get("weight_decay", 1e-4),
         )
         criterion = build_criterion(loss_spec, self.device)
+        # Optional loss warm-up: soft IoU has a cold-start collapse on sparse
+        # targets (intersection≈0 → vanishing gradient → stuck at all-negative).
+        # A few epochs of BCE (strong per-pixel gradient everywhere) pull the
+        # model out of that basin first; then the paper's soft IoU takes over.
+        warmup_loss_spec = config.get("warmup_loss_spec")
+        warmup_epochs = int(config.get("warmup_epochs", 0)) if warmup_loss_spec else 0
+        warmup_criterion = build_criterion(warmup_loss_spec, self.device) if warmup_epochs else None
         print(f"Loss: {loss_spec}  LR: {config['lr']}  WD: {config.get('weight_decay', 1e-4)}  "
-              f"Scheduler: {config.get('scheduler', 'onecycle')}")
+              f"Scheduler: {config.get('scheduler', 'onecycle')}"
+              + (f"  Warmup: {warmup_loss_spec}×{warmup_epochs}ep" if warmup_criterion else ""))
 
         steps_per_epoch = len(train_loader)
         if config.get("scheduler", "onecycle") == "warmup_poly":
@@ -197,6 +205,10 @@ class DiffusionCLI:
         best_val_loss, best_dice, best_proportion = None, None, None
         for epoch in range(start_epoch, start_epoch + num_epochs):
             start_time = time.time()
+            in_warmup = warmup_criterion is not None and (epoch - start_epoch) < warmup_epochs
+            epoch_criterion = warmup_criterion if in_warmup else criterion
+            if in_warmup and (epoch - start_epoch) == 0:
+                print(f"[warmup] epochs 1-{warmup_epochs}: {warmup_loss_spec} → then {loss_spec}")
             train_loss = train(
                 model,
                 train_loader,
@@ -206,7 +218,7 @@ class DiffusionCLI:
                 epoch,
                 config["batch_size"],
                 checkpoint_path,
-                criterion,
+                epoch_criterion,
                 center_crop=config.get("center_crop"),
             )
             val_metrics = val(
